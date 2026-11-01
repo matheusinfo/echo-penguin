@@ -47,7 +47,11 @@ eval "$(on '. /lib/penguin.sh; p_settings
 	echo "uptime=$(cut -d. -f1 /proc/uptime)"
 	# Only dmesg-ramoops records are panics; console-ramoops is the console of every reboot, clean ones too.
 	echo "crashes=$(ls /data/techo5-linux/crash 2>/dev/null | grep -c "^[0-9]*-dmesg-ramoops")"
-	echo "rofs=$(grep -c " / .*ro[ ,]" /proc/mounts)"')"
+	echo "rofs=$(grep -c " / .*ro[ ,]" /proc/mounts)"
+	echo "ui=$(ps | grep -c "[p]enguin-ui")"
+	echo "touch=$(grep -c "^N: Name=\"goodix-ts\"" /proc/bus/input/devices)"
+	echo "fbcon=$(grep -c "frame buffer" /sys/class/vtconsole/vtcon*/name 2>/dev/null | grep -c ":1")"
+	echo "vol=$(/usr/local/sbin/penguin-sound volume 2>/dev/null)"')"
 
 note "release: $rel"
 note "kernel: $kern, docker: ${docker:-?}, slot ${slot:-none} ($slotstate)"
@@ -57,6 +61,12 @@ case "$slotstate" in good) pass "slot committed (good)";; trial*) warn "slot sti
 # MediaTek's hotplug (/proc/hps) takes idle cores offline and brings them back under load, so the
 # number online at any moment says nothing; all four must exist and hps must be on.
 [ "$cpus" = 0-3 ] && [ "${hps:-1}" = 1 ] && pass "four cores, MediaTek hotplug on" || warn "cores: $cpus, hotplug: ${hps:-?}"
+[ "${fbcon:-0}" -ge 1 ] && pass "screen console (fbcon)" || fail "no framebuffer console: the screen shows nothing"
+if [ "${SCREEN_UI_EXPECTED:-1}" = 1 ]; then
+	[ "${ui:-0}" = 1 ] && pass "touch interface running" || fail "penguin-ui is not running (${ui:-0} instances)"
+fi
+[ "${touch:-0}" = 1 ] && pass "touchscreen present (goodix-ts)" || fail "no goodix-ts input device"
+case "$vol" in [0-9]*) pass "speaker volume control: $vol %";; *) fail "no speaker volume control (penguin-sound volume)";; esac
 [ "${avail:-0}" -ge 150 ] && pass "memory available: ${avail} MB" || fail "memory available: ${avail} MB (< 150)"
 [ "$zram" = 1 ] && pass "zram swap active" || warn "no zram swap"
 [ "$wd" = 1 ] && pass "watchdog fed" || warn "watchdog not running"

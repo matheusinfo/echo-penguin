@@ -2,9 +2,10 @@
 
 **Turn an Amazon Echo Show 5 (2nd gen) into a tiny, always-on Linux server.**
 
-echo-penguin replaces Android on the Echo Show 5 2nd gen (codename `cronos`) with a headless
-[Alpine Linux](https://alpinelinux.org/): you get Wi-Fi, SSH with keys only, Docker, and a system
-built to run 24/7 without anyone touching it. It is built on top of the
+echo-penguin replaces Android on the Echo Show 5 2nd gen (codename `cronos`) with
+[Alpine Linux](https://alpinelinux.org/): you get Wi-Fi, SSH with keys only, Docker, a simple touch
+screen with a clock, alarm and system information, the speaker, and a system built to run 24/7
+without anyone touching it. It is built on top of the
 [TECHO5](https://github.com/HuskerMinion/techo5) boot chain.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -13,8 +14,9 @@ built to run 24/7 without anyone touching it. It is built on top of the
 
 > [!WARNING]
 > Installing **erases Android (LineageOS)** from the unit. It requires an Echo Show 5 2nd gen that
-> is already unlocked and running LineageOS 18.1 (see [References](#references)). Everything here
-> is at your own risk. This project is not affiliated with or endorsed by Amazon.
+> is unlocked and running LineageOS 18.1: **[INSTALL.md](INSTALL.md) walks through all of it, from a
+> locked unit.** Everything here is at your own risk. This project is not affiliated with or
+> endorsed by Amazon.
 
 ## Contents
 
@@ -40,7 +42,8 @@ built to run 24/7 without anyone touching it. It is built on top of the
 | **Containers** | Docker (overlay2, data on `/data/docker`) on the `docker` kernel |
 | **Reliability** | hardware watchdog, temperature guard, weekly restart, rotated logs, A/B system slots with automatic rollback |
 | **Security** | firewall closes everything on Wi-Fi except SSH and the ports you choose |
-| **Screen** | kernel and boot messages on the built-in display (framebuffer console) |
+| **Screen** | a touch interface (clock, alarm/stopwatch/timer, system, network & SSH, installed software, logs, brightness/volume); kernel and boot messages while it boots |
+| **Sound** | the built-in speaker (`penguin-sound`), the volume buttons |
 
 Typical uses: a home lab node, a small self-hosted service, a Docker host for lightweight
 containers, an always-on SSH jump box.
@@ -59,10 +62,14 @@ containers, an always-on SSH jump box.
 **Non-goals**
 
 - What runs on top (your containers and services): that is up to you.
-- Touchscreen UI, voice assistant, audio, camera or Bluetooth.
+- A desktop, voice assistant, microphones, camera or Bluetooth. The screen is a small text UI, not a
+  graphical environment.
 - Other Echo models. TECHO5 supports more devices; echo-penguin only targets `cronos`.
 
 ## Quick start
+
+Starting from a locked unit, or unsure about any step: follow **[INSTALL.md](INSTALL.md)**. This
+section is the short version for a unit that already runs LineageOS.
 
 ### 1. What you need
 
@@ -162,8 +169,22 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 | `DOCKER_LAN` | `0` | `1` lets containers' published ports be reached from Wi-Fi |
 | `DOCKER` | `auto` | start Docker when the kernel supports it, or `off` |
 | `BACKLIGHT` | `90` | screen brightness 0–255 (`0` = off) |
+| `SCREEN_UI` | `1` | the touch interface; `0` = the screen shows the log console only |
+| `SCREEN_MIRROR` | `1` | show interactive SSH/USB sessions on the screen's log console |
+| `VOLUME` | `50` | speaker volume 0–100 |
 | `TEMP_CRIT` | `85` | °C at which running containers are paused |
 | `WEEKLY_REBOOT_DAY` / `_HOUR` | `0` / `4` | weekly restart (Sunday 04:00); empty = never |
+
+**The screen.** The home screen shows the time and six buttons: **Logs** (kernel errors, the boot
+log and every interactive SSH or USB-console session, live), **System**, **Network & SSH**,
+**Clock** (alarm, stopwatch, timer), **Installed** and **Display & sound** (brightness, volume,
+screen off). `< Back` returns. The volume buttons on top change the volume, or stop a ringing alarm.
+The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on the kernel's
+framebuffer console, Python's standard library only.
+
+**Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav`,
+`penguin-sound volume [0-100]`. It holds the workaround the MediaTek playback driver needs (without
+it, the first sound panics the kernel), so use it rather than `aplay` directly.
 
 **Reaching a container.** Published ports are closed on Wi-Fi by default; use an SSH tunnel:
 
@@ -309,6 +330,8 @@ previous image back if it does not return.
 flowchart TB
     INITD[busybox init] -->|sysinit| BOOT[boot.sh]
     INITD -->|respawn| RUN[techo5-run]
+    INITD -->|respawn, tty1| UI[penguin-ui · touch screen]
+    UI -->|alarm, test| SND[penguin-sound · speaker]
     RUN --> SUP[supervisor · techo5]
     SUP -->|starts, restarts| DD[dockerd → containers]
     SUP -->|above TEMP_CRIT| PAUSE[pause containers]
@@ -326,6 +349,8 @@ flowchart TB
   `LAN_PORTS`, DHCP, ICMP and replies get in. Container ports are filtered in Docker's
   `DOCKER-USER` chain. If a rule fails, that address family is left open rather than locking you
   out. The kernel has no nftables, so `iptables` points to the legacy backend.
+- **Screen** ([penguin-ui](rootfs/usr/local/bin/penguin-ui)): the touch interface on tty1. The
+  log console (kernel errors, boot log, mirrored sessions) is tty2, shown by its Logs screen.
 - **Watchdog**: if userspace hangs, the hardware watchdog restarts the unit.
 - **SSH**: password logins are disabled; only keys in `/data/misc/techo5/ssh/authorized_keys`
   work.
@@ -399,17 +424,20 @@ tell the story; include them when you [open an issue](#reporting-a-problem).
 ## Repository layout
 
 ```
+INSTALL.md              step by step, from a locked Echo to echo-penguin
 config.env              pinned inputs: TECHO5, kernel, Wi-Fi driver, toolchain, paths
 kernel/
   safe.config           options added to cronos_defconfig in both kernels (CRC-neutral, measured)
   docker.config         what the docker kernel adds (changes CRCs: needs the rebuilt driver)
-  patches/              kernel patches (GPL-2.0)
+  patches/              kernel patches (GPL-2.0): screen console colors, rotation, font
 rootfs-packages.txt     Alpine packages in the system image
 rootfs/                 files laid over Alpine and TECHO5's rootfs
   etc/techo5/           boot.sh, shutdown.sh, trial.conf
   etc/penguin/          default settings
+  etc/inittab           busybox init: boot, supervisor, USB console, touch interface
   usr/local/bin/techo5  the supervisor
-  usr/local/sbin/       penguin, techo5-firewall, techo5-run, rebootto
+  usr/local/bin/penguin-ui   the touch interface on the screen
+  usr/local/sbin/       penguin, penguin-sound, techo5-firewall, techo5-run, rebootto
 scripts/                run on the PC
   setup.sh build-all.sh build-kernel.sh build-boot.sh build-rootfs.sh mkrootfs.sh
   install.sh finish-install.sh flash-boot.sh verify.sh
