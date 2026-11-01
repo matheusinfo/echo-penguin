@@ -4,6 +4,12 @@ Versions are the root filesystem's (`/etc/techo5-release` on the unit, `-V` of `
 The boot images (kernels) are rebuilt alongside them; the changes to them are listed under the
 version that first needed them. Every version below ran on an Echo Show 5 2nd gen.
 
+## v0.2.7 — 2026-11-01
+
+- `penguin cleanup` lists what the unit no longer needs: installed rootfs tarballs, test files left
+  in `/data/penguin`, stopped containers no compose project owns, untagged images and the build
+  cache. `--yes` removes them; `--slot` adds the inactive slot (only once the running one is good).
+
 ## v0.2.6 — 2026-11-01
 
 An alarm that repeats, and taps that no longer crash the screen.

@@ -164,6 +164,7 @@ ssh -i ~/.ssh/techo5 root@<echo-ip>
 | `penguin ssh` | SSH on/off, the allowed computers, the authorized keys and their fingerprints |
 | `penguin ssh allow here` / `deny ADDR` / `allow any` | add this computer to the SSH allow list, remove one, clear the list |
 | `penguin ssh on` / `off` | start or stop SSH |
+| `penguin cleanup [--slot] [--yes]` | list what is no longer needed (installed rootfs tarballs, test files, stopped containers outside compose, untagged images); `--yes` removes it, `--slot` adds the inactive slot |
 
 **Settings.** Defaults live in [/etc/penguin/defaults.conf](rootfs/etc/penguin/defaults.conf);
 your overrides go to `/data/penguin/settings.conf`. The most useful ones:
@@ -409,6 +410,10 @@ ssh root@<ip> 'slotctl install /data/techo5-linux/echo-penguin-rootfs-<v>.tar.gz
 The update goes into the inactive slot on trial and rolls back on its own if it does not settle
 (see [Safe updates](#safe-updates-ab-slots-with-a-trial)). Settings, logs and containers on
 `/data` are kept.
+
+Once the new slot is good (`slotctl status`, about five minutes after the reboot), `penguin cleanup
+--yes` removes the tarball. The slot it replaced stays as the way back; `penguin cleanup --slot
+--yes` removes that too, though it frees space on `/store` only, which holds nothing else.
 
 ### Switching kernels
 

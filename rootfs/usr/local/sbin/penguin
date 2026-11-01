@@ -12,6 +12,7 @@
 #   penguin ssh allow here | ADDR...   add computers (MAC / IP / network); then only those connect
 #   penguin ssh deny ADDR...    remove computers from that list
 #   penguin ssh allow any       clear the list: any device on the Wi-Fi may try (a key is still needed)
+#   penguin cleanup [--slot] [--yes]   list what is no longer needed; --yes removes it (--slot: old slot too)
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 . /lib/penguin.sh
 p_settings
@@ -172,9 +173,96 @@ ssh_cmd() {
 	esac
 }
 
+human_kb() {
+	awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k / 1048576; else if (k >= 1024) printf "%.1f MB", k / 1024; else printf "%d KB", k }'
+}
+
+data_free() { df -k /data | awk 'NR == 2 {print $4}'; }
+
+# cleanup [--slot] [--yes]: what the unit no longer needs. Without --yes it only lists it.
+cleanup() {
+	yes= slot=
+	for a in "$@"; do
+		case "$a" in
+		--yes) yes=1;;
+		--slot) slot=1;;
+		*) echo "usage: penguin cleanup [--slot] [--yes]" >&2; exit 2;;
+		esac
+	done
+	total=0 free0=$(data_free)
+	# item <KB> <what>: one line of the list.
+	item() { total=$((total + $1)); printf '  %9s  %s\n' "$(human_kb "$1")" "$2"; }
+	[ -n "$yes" ] && echo "removing:" || echo "no longer needed (penguin cleanup --yes removes it):"
+
+	# Root filesystem tarballs: an installed one lives on in its slot, and the computer that built
+	# it keeps a copy.
+	for f in /data/media/0/Download/*-rootfs-*.tar.gz /data/techo5-linux/*-rootfs-*.tar.gz; do
+		[ -f "$f" ] || continue
+		item "$(du -sk "$f" | cut -f1)" "$f"
+		[ -n "$yes" ] && rm -f "$f"
+	done
+
+	# Files tried out with a bind mount over the read-only root, unless one is still mounted.
+	for f in $PENGUIN_DATA/*.test; do
+		[ -f "$f" ] || continue
+		n=$(basename "$f" .test)
+		for t in /usr/local/bin/$n /usr/local/sbin/$n /lib/$n; do
+			[ "$f" -ef "$t" ] && continue 2
+		done
+		item "$(du -sk "$f" | cut -f1)" "$f (a test file)"
+		[ -n "$yes" ] && rm -f "$f"
+	done
+
+	if [ "$(cat /run/penguin/docker 2>/dev/null)" = docker ] && docker info >/dev/null 2>&1; then
+		# Stopped containers no compose project owns: one-off docker run and failed builds. A
+		# project's stay for docker compose start.
+		for id in $(docker ps -aq --filter status=exited --filter status=created); do
+			info=$(docker container inspect --size -f '{{.SizeRw}} {{index .Config.Labels "com.docker.compose.project"}} {{.Name}} {{.Config.Image}}' "$id") || continue
+			set -- $info
+			[ $# -eq 3 ] || continue
+			case "$3" in sha256:*) img=$(echo "${3#sha256:}" | cut -c1-12);; *) img=$3;; esac
+			item $(($1 / 1024)) "container ${2#/} ($img, stopped)"
+			[ -n "$yes" ] && docker rm "$id" >/dev/null
+		done
+		n=$(docker images -qf dangling=true | wc -l)
+		[ "$n" -gt 0 ] && printf '  %9s  %s\n' '' "$n untagged image(s) left by rebuilds, and the build cache"
+		[ -n "$yes" ] && { docker image prune -f >/dev/null; docker builder prune -f >/dev/null 2>&1; }
+	fi
+
+	b=$(cat /run/techo5/slot 2>/dev/null)
+	case "$b" in a) o=b;; b) o=a;; *) o=;; esac
+	if [ -n "$o" ] && [ -d /store/slots/$o ]; then
+		rel=$(cat /store/slots/$o/etc/techo5-release 2>/dev/null | cut -d' ' -f1-3)
+		if [ -z "$slot" ]; then
+			echo "kept: slot $o ($rel), the way back if slot $b fails; --slot removes it (frees /store only)"
+		elif [ "$(cat /store/active 2>/dev/null)" != "$b" ] || [ "$(cat /store/slots/$b.state 2>/dev/null)" != good ]; then
+			echo "kept: slot $o, since slot $b is not yet the good, active one (slotctl status)"
+		else
+			item "$(du -sk /store/slots/$o | cut -f1)" "slot $o: $rel (on /store; no way back to it)"
+			if [ -n "$yes" ]; then
+				STORE=/store slotctl rw >/dev/null &&
+					rm -rf /store/slots/$o /store/slots/$o.state
+				sync
+				STORE=/store slotctl ro >/dev/null
+				# The boot layer, where installed, must not pick the slot either (3: no boot layer).
+				bootctl -q mark-bad $o 2>/dev/null
+			fi
+		fi
+	fi
+
+	if [ $total -eq 0 ] && [ -z "${n#0}" ]; then
+		echo "  nothing"
+	elif [ -n "$yes" ]; then
+		echo "freed on /data: $(human_kb $(($(data_free) - free0)))   (free now: $(human_kb $(data_free)))"
+	else
+		echo "total: $(human_kb $total)"
+	fi
+}
+
 case "${1:-status}" in
 status) status;;
 ssh) shift; ssh_cmd "$@";;
+cleanup) shift; cleanup "$@";;
 logs)
 	what=${2:-supervisor}; follow=
 	[ "${3:-}" = -f ] || [ "${2:-}" = -f ] && follow=1
