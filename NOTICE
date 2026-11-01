@@ -1,0 +1,63 @@
+echo-penguin
+Copyright (c) 2026 echo-penguin contributors
+Licensed under the MIT License (see LICENSE), with the exceptions below.
+
+-------------------------------------------------------------------------------
+Code derived from TECHO5
+-------------------------------------------------------------------------------
+https://github.com/HuskerMinion/techo5
+
+These files are modified copies of, or ports of, TECHO5 files:
+
+  scripts/mkrootfs.sh               from tools/linux/mkrootfs.sh
+  rootfs/etc/techo5/boot.sh         from etc/techo5/boot.sh (tools/linux/rootfs)
+  rootfs/usr/local/sbin/rebootto    Python port of cmd/rebootto
+
+TECHO5 is distributed under the following license:
+
+  MIT License
+
+  Copyright (c) 2026 TECHO5 contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+-------------------------------------------------------------------------------
+Linux kernel patches
+-------------------------------------------------------------------------------
+kernel/patches/*.patch modify the Linux kernel tree at
+https://github.com/amazon-oss/android_kernel_amazon_mt8163 and are licensed
+under the GNU General Public License, version 2 (GPL-2.0-only), like the code
+they modify.
+
+-------------------------------------------------------------------------------
+Third-party software fetched at build time
+-------------------------------------------------------------------------------
+This repository does not contain the following; scripts/setup.sh downloads
+them, and the boot and rootfs images the scripts build include them, each
+under its own license:
+
+  TECHO5 boot chain and tools      MIT
+  Linux kernel (amazon-oss)        GPL-2.0
+  MT7668 Wi-Fi driver (amazon-oss) Dual BSD/GPL, with some files marked
+                                   MediaTek proprietary
+  Alpine Linux and its packages    various (see each package)
+  Arm GNU Toolchain                various (GPL-3.0 with exceptions, etc.)
+
+Vendor modules and firmware are read from the user's own unit or LineageOS
+zip during the build and are not distributed by this project.
