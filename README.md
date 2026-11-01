@@ -109,8 +109,8 @@ scripts/build-all.sh
 ```
 
 This fetches every input at its pinned commit, builds both kernels, both boot images and the root
-filesystem. Everything downloaded or generated goes to `../echo-penguin-build/` (override with
-`PENGUIN_BUILD=`), never into the repository. The results are in `../echo-penguin-build/work/out/`.
+filesystem. Everything downloaded or generated goes to `build/` (git-ignored; override with
+`PENGUIN_BUILD=`). The results are in `build/work/out/`.
 
 ### 3. Install
 
@@ -270,7 +270,7 @@ flowchart LR
 ```
 
 The repository holds only configuration, scripts and the files laid over Alpine. Upstream code is
-fetched at pinned commits into `../echo-penguin-build/` and is never edited in place.
+fetched at pinned commits into `build/` (git-ignored) and is never edited in place.
 
 ### Storage layout on the Echo
 
@@ -403,7 +403,7 @@ flowchart TB
 
 ```bash
 scripts/build-rootfs.sh
-scp ../echo-penguin-build/work/out/echo-penguin-rootfs-<v>.tar.gz root@<ip>:/data/techo5-linux/
+scp build/work/out/echo-penguin-rootfs-<v>.tar.gz root@<ip>:/data/techo5-linux/
 ssh root@<ip> 'slotctl install /data/techo5-linux/echo-penguin-rootfs-<v>.tar.gz && reboot'
 ```
 
@@ -430,9 +430,9 @@ connected for the whole run. Switching to `docker` requires a rootfs built after
 
 | To go back to | How |
 |---|---|
-| the `safe` kernel | `flash-boot.sh safe`, or `fastboot flash boot ../echo-penguin-build/work/out/echo-penguin-boot-safe.img` |
+| the `safe` kernel | `flash-boot.sh safe`, or `fastboot flash boot build/work/out/echo-penguin-boot-safe.img` |
 | the previous system slot | automatic on a failed trial; by hand: `slotctl rollback` |
-| LineageOS | `fastboot flash boot ../echo-penguin-build/techo5/inputs/boot-lineage-18.1-20260904-cronos.img`, then flash the LineageOS zip in TWRP (recovery is untouched). See TECHO5's `docs/install.md`, "To go back to LineageOS". |
+| LineageOS | `fastboot flash boot build/techo5/inputs/boot-lineage-18.1-20260904-cronos.img`, then flash the LineageOS zip in TWRP (recovery is untouched). See TECHO5's `docs/install.md`, "To go back to LineageOS". |
 | Fire OS (factory) | the TECHO5 installer's backup of the small partitions in `techo5/backups/<serial>/partitions/` (`p9-boot.img` is the original boot; checksums in `SHA256SUMS`) |
 
 ## Troubleshooting
@@ -497,7 +497,7 @@ scripts/                run on the PC
   check-modversions.py bisect-crc.sh sdat2img.py   kernel/driver diagnostics
 ```
 
-Outside the repository, in `../echo-penguin-build/`:
+In `build/`, which git ignores; all of it can be fetched and built again (`scripts/build-all.sh`):
 
 ```
 techo5/       TECHO5 at the pinned commit, and its inputs
@@ -507,7 +507,7 @@ work/out/     the finished boot images, kernels and rootfs tarballs
 
 ## Status and next steps
 
-**Current version: v0.2.5** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+**Current version: v0.2.7** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
 the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
 power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
 SSH controls.

@@ -103,15 +103,15 @@ scripts/build-all.sh
 
 `build-all.sh` fetches every input at its pinned commit (TECHO5, the kernel source, the Wi-Fi driver
 source, the toolchain, Alpine), builds both kernels, both boot images and the root filesystem. All of
-it goes into `../echo-penguin-build/`, never into the repository. It refuses to produce a kernel the
-Wi-Fi driver would not load on.
+it goes into `build/`, which git ignores. It refuses to produce a kernel the Wi-Fi driver would not
+load on.
 
 - Building the root filesystem runs ARM package scripts under QEMU. If it stops with *no qemu-arm
   binfmt handler*, register it (this lasts until the PC reboots):
   `docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.2 --install arm`
 - `LINEAGE_ZIP=/path/to/the.zip` points the build at a zip outside `../echo-show/`.
 
-**Check:** `ls ../echo-penguin-build/work/out/` lists `echo-penguin-boot-safe.img`,
+**Check:** `ls build/work/out/` lists `echo-penguin-boot-safe.img`,
 `echo-penguin-boot-docker.img` and `echo-penguin-rootfs-<version>.tar.gz`.
 
 ## 5. Install

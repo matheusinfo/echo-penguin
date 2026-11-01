@@ -1,4 +1,5 @@
-# Builds and upstream checkouts live outside the repository (../echo-penguin-build, config.env).
+# Builds and upstream checkouts (PENGUIN_BUILD in config.env).
+/build/
 __pycache__/
 # Never commit the app's secrets.
 .env

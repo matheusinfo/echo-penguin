@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 
-BUILD = os.environ.get('PENGUIN_BUILD') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'echo-penguin-build')
+BUILD = os.environ.get('PENGUIN_BUILD') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'build')
 sys.path.insert(0, os.path.join(BUILD, 'techo5', 'tools'))
 from techo5lib import CONSOLE_TECHO5, Console  # noqa: E402
 

@@ -4,7 +4,7 @@
 #
 #   scripts/setup.sh
 #
-# Everything goes into PENGUIN_BUILD (config.env; default ../echo-penguin-build), not this repository.
+# Everything goes into PENGUIN_BUILD (config.env; default build/, which git ignores).
 # Fetches: TECHO5, the LineageOS kernel tree, the MT7668 Wi-Fi driver source, Arm's
 # GCC 8.3 and TECHO5's public inputs (Alpine base, busybox.static, apk.static, rescue apks). Copies this unit's LineageOS boot image
 # (the donor for the boot image header and command line) from the earlier TECHO5 backup when found.
