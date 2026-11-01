@@ -1,0 +1,68 @@
+#!/bin/sh
+# techo5-firewall (echo-penguin): on Wi-Fi nothing reaches the unit except SSH (22/tcp), the TCP ports
+# in LAN_PORTS, DHCP replies, ping/ICMPv6 and replies to connections it made. Run by boot.sh before the
+# network comes up, and again by the supervisor after dockerd has made its chains; safe to run any
+# number of times. `penguin firewall` runs it after a settings change.
+#
+# Each address family stands alone: a rule that fails leaves that family's chain empty (open) rather
+# than a unit nobody can reach, and says so, without touching the other family.
+#
+# Docker's published ports are DNATed in PREROUTING and never cross INPUT, so they are governed in
+# DOCKER-USER, the chain Docker leaves to the administrator: refused from Wi-Fi unless DOCKER_LAN=1
+# (IPv4 only: daemon.json has ip6tables off). The kernel has no nftables: the legacy tools.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+. /etc/penguin/defaults.conf
+[ -r /data/penguin/settings.conf ] && . /data/penguin/settings.conf
+
+command -v iptables-legacy > /dev/null || { echo "techo5-firewall: no iptables-legacy in this image" >&2; exit 0; }
+CHAIN=PENGUIN-IN
+PORTS=
+for p in ${LAN_PORTS:-}; do
+	case "$p" in *[!0-9]*|"") echo "techo5-firewall: LAN_PORTS: '$p' is not a port; ignored" >&2;; *) PORTS="$PORTS $p";; esac
+done
+
+# rules <tool>: PENGUIN-IN for one family, jumped to from INPUT for wlan0.
+rules() {
+	T=$1
+	$T -w -N $CHAIN 2> /dev/null
+	$T -w -F $CHAIN || return 1
+	$T -w -C INPUT -i wlan0 -j $CHAIN 2> /dev/null || $T -w -I INPUT -i wlan0 -j $CHAIN || return 1
+	$T -w -A $CHAIN -m state --state ESTABLISHED,RELATED -j ACCEPT || return 1
+	for p in 22 $PORTS; do
+		$T -w -A $CHAIN -p tcp --dport "$p" -j ACCEPT || return 1
+	done
+	if [ "$T" = iptables-legacy ]; then
+		$T -w -A $CHAIN -p udp --sport 67 --dport 68 -j ACCEPT || return 1
+		$T -w -A $CHAIN -p icmp -j ACCEPT || return 1
+	else
+		$T -w -A $CHAIN -p ipv6-icmp -j ACCEPT || return 1
+		$T -w -A $CHAIN -p udp --sport 547 --dport 546 -j ACCEPT || return 1
+	fi
+	$T -w -A $CHAIN -j DROP
+}
+
+status=0
+for T in iptables-legacy ip6tables-legacy; do
+	if rules $T 2> /tmp/firewall.$T.err; then
+		echo "techo5-firewall: $T: Wi-Fi inbound closed except tcp 22$PORTS" >&2
+	else
+		$T -w -F $CHAIN 2> /dev/null
+		echo "techo5-firewall: $T: a rule failed ($(tail -1 /tmp/firewall.$T.err)); left open" >&2
+		status=1
+	fi
+done
+
+if iptables-legacy -w -n -L DOCKER-USER > /dev/null 2>&1; then
+	if iptables-legacy -w -F DOCKER-USER &&
+		iptables-legacy -w -A DOCKER-USER -i wlan0 -m state --state ESTABLISHED,RELATED -j RETURN &&
+		{ [ "${DOCKER_LAN:-0}" = 1 ] || iptables-legacy -w -A DOCKER-USER -i wlan0 -m state --state NEW -j DROP; } &&
+		iptables-legacy -w -A DOCKER-USER -j RETURN; then
+		echo "techo5-firewall: DOCKER-USER: published ports $([ "${DOCKER_LAN:-0}" = 1 ] && echo open || echo closed) on Wi-Fi" >&2
+	else
+		iptables-legacy -w -F DOCKER-USER 2> /dev/null
+		echo "techo5-firewall: DOCKER-USER rules failed; published ports open" >&2
+		status=1
+	fi
+fi
+exit $status
