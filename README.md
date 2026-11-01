@@ -28,6 +28,7 @@ without anyone touching it. It is built on top of the
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
+- [Status and roadmap](#status-and-roadmap)
 - [Contributing](#contributing)
 - [References](#references)
 - [License](#license)
@@ -53,7 +54,8 @@ containers, an always-on SSH jump box.
 **Goals**
 
 - Run plain Linux on the Echo Show 5 2nd gen, **without Android**.
-- Be **headless and reachable**: Wi-Fi and SSH come up on every boot, with no screen interaction.
+- Be **reachable without touching it**: Wi-Fi and SSH come up on every boot on their own; the touch
+  screen is there for a glance (time, address, logs), never required.
 - Run **24/7 unattended**, and recover on its own from bad updates, hangs and overheating.
 - Be **reproducible**: every input is pinned in [config.env](config.env), and the build refuses to
   produce an image that would boot without Wi-Fi.
@@ -456,6 +458,11 @@ or `ssh root@<ip> 'PATH=/usr/local/sbin:$PATH penguin status'`.
 **The rescue environment rebooted by itself.** Without network, rescue reboots after 15 minutes so
 an unattended unit never stays stuck. On the USB console, `touch /tmp/stay` keeps it up.
 
+**The load average sits at 4 with nothing running.** Four of the vendor kernel's threads
+(`GCPU`, `display_esd_check`, `display_idle_detect`, `dynamic_boost`) wait in uninterruptible sleep
+for good, and Linux counts those in the load. The CPU is idle (`top`); nothing in echo-penguin acts
+on the load.
+
 **Something else.** `penguin logs boot`, `penguin logs supervisor` and `slotctl status` usually
 tell the story; include them when you [open an issue](#reporting-a-problem).
 
@@ -463,6 +470,7 @@ tell the story; include them when you [open an issue](#reporting-a-problem).
 
 ```
 INSTALL.md              step by step, from a locked Echo to echo-penguin
+CHANGELOG.md            what each version changed
 config.env              pinned inputs: TECHO5, kernel, Wi-Fi driver, toolchain, paths
 kernel/
   safe.config           options added to cronos_defconfig in both kernels (CRC-neutral, measured)
@@ -490,6 +498,34 @@ techo5/       TECHO5 at the pinned commit, and its inputs
 work/         kernel tree, toolchain, Wi-Fi driver, extracted LineageOS, staging
 work/out/     the finished boot images, kernels and rootfs tarballs
 ```
+
+## Status and roadmap
+
+**Current version: v0.2.5** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+the docker kernel. `verify.sh` passes, and warm reboots, power cuts, slot switches with rollback
+protection, Docker, the touch screen, the speaker and the SSH controls have all been tested on the
+unit.
+
+Still to be confirmed over time: 24 h and 72 h unattended, a Wi-Fi outage (router off for a
+minute), and a deliberate rollback.
+
+Not there yet, roughly in order of usefulness:
+
+1. **Changing the Wi-Fi network from the unit.** The network comes from LineageOS, or from
+   `--wifi` at install time. Moving the Echo to another router means editing
+   `/data/techo5-linux/wpa_supplicant.conf` from the USB console. A `penguin wifi` command (and a
+   screen for it) would close this.
+2. **One-command updates from the PC**: build, copy, `slotctl install`, reboot, wait for the commit,
+   verify. Today it is the three commands under [Updating the system](#updating-the-system).
+3. **Night mode / automatic brightness.** The light sensor (`m_alsps_input`) is unused, and the
+   panel stays at `BACKLIGHT` around the clock.
+4. **Backup and restore of `/data`**: keys, settings, the alarm, containers' volumes.
+5. **The mute button** (`gpio-privacy-button`) does nothing yet; it could turn the screen off/on or
+   stop the alarm.
+6. **The rescue environment's SSH** (TECHO5's initramfs, only after a failed boot) runs without the
+   firewall or `SSH_ALLOW`. A build-time fix like the existing NTP one would cover it.
+7. **A name on the network** (`echo-penguin.local`), so the IP does not have to be looked up (it is
+   on the screen meanwhile).
 
 ## Contributing
 
