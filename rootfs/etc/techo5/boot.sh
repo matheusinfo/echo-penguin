@@ -15,7 +15,7 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 LOGDIR=/data/techo5-linux
-log() { echo "techo5-boot: $*" > /dev/kmsg; echo "$(cut -d' ' -f1 /proc/uptime) $*" >> /run/boot.log; [ -n "$P_SCREEN" ] && echo "$*" > /dev/tty1 2>/dev/null; return 0; }
+log() { echo "techo5-boot: $*" > /dev/kmsg; echo "$(cut -d' ' -f1 /proc/uptime) $*" >> /run/boot.log; [ -n "$P_SCREEN" ] && echo "$*" > "$P_SCREEN" 2>/dev/null; return 0; }
 
 DATA_DEV=/dev/mmcblk0p16
 STORE_DEV=/dev/mmcblk0p12
@@ -74,12 +74,13 @@ hostname -F /etc/hostname
 p_screen
 log "slot $(cat /run/techo5/slot 2>/dev/null || echo '?'): $(cat /etc/techo5-release 2>/dev/null)"
 
-# --- Hardware (validated-hardware.md): all four cores, zram swap, cgroups for Docker, screen,
+# --- Hardware (validated-hardware.md): all four cores, zram swap, cgroups for Docker, screen, sound,
 # watchdog. Before the network so a hang from here on is caught by the watchdog.
 p_cpus
 p_zram
 p_cgroups
 p_backlight
+p_audio
 p_watchdog
 
 # --- Vendor tree: LineageOS's Wi-Fi firmware and modules, kept once in the store (TECHO5's scheme:

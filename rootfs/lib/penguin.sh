@@ -18,20 +18,43 @@ p_log() {
 	tag=$1; shift
 	echo "penguin-$tag: $*" > /dev/kmsg 2>/dev/null
 	echo "$(cut -d' ' -f1 /proc/uptime) $tag: $*" >> /run/boot.log 2>/dev/null
-	# On the screen too: the kernel console only shows errors once p_screen has run.
-	[ -n "$P_SCREEN" ] && echo "$tag: $*" > /dev/tty1 2>/dev/null
+	# On the log console too: the kernel console only shows errors once p_screen has run.
+	[ -n "$P_SCREEN" ] && echo "$tag: $*" > "$P_SCREEN" 2>/dev/null
 	return 0
 }
 
-# p_screen: the panel's terminal (tty1, the framebuffer console). The kernel prints everything there
-# until now; from here only messages more urgent than SCREEN_LOGLEVEL (default 4: errors and worse),
+# p_screen: the panel's log console. Until now the kernel printed everything on tty1, the boot screen.
+# From here: only kernel messages more urgent than SCREEN_LOGLEVEL (default 4: errors and worse),
 # since MediaTek's drivers log warnings every few seconds ("[WDK]: kick Ex WDT") and would scroll
-# everything else away. echo-penguin's own events (p_log) and mirrored sessions go to tty1 directly.
+# everything else away. With SCREEN_UI=1 the log console is tty2 (setlogcons sends the kernel's
+# messages there) and tty1 is left to penguin-ui; with SCREEN_UI=0 it stays tty1. P_SCREEN is the
+# log console's device: echo-penguin's own events (p_log, log) and mirrored sessions go there.
 p_screen() {
 	[ -c /dev/tty1 ] || return 0
+	t=/dev/tty1
+	if [ "${SCREEN_UI:-1}" = 1 ] && [ -x /usr/local/bin/penguin-ui ]; then
+		t=/dev/tty2
+		setlogcons 2 2>/dev/null
+	fi
 	dmesg -n "${SCREEN_LOGLEVEL:-4}" 2>/dev/null
-	P_SCREEN=1
-	printf '\n\033[1;36mecho-penguin\033[0m %s\n' "$(cat /etc/techo5-release 2>/dev/null)" > /dev/tty1 2>/dev/null
+	# No echo: shells mirrored there ask for the cursor position (ESC [6n), and the console would
+	# print its own answer ("^[[21;18R") since nothing reads its input.
+	stty -F $t -echo 2>/dev/null
+	# Never blank (the kernel's default is after 10 idle minutes; consoleblank=0 would lengthen the
+	# bootloader's command line, which hangs warm reboots).
+	printf '\033[9;0]' > $t 2>/dev/null
+	P_SCREEN=$t
+	printf '\n\033[1;36mecho-penguin\033[0m %s\n' "$(cat /etc/techo5-release 2>/dev/null)" > $t 2>/dev/null
+	[ $t = /dev/tty2 ] && cut -d' ' -f2- /run/boot.log > $t 2>/dev/null  # what boot.sh said so far
+	return 0
+}
+
+# p_audio: the amplifier volume (VOLUME). Playback itself is penguin-sound's, which holds the
+# workaround the MediaTek playback driver needs (see its header).
+p_audio() {
+	[ -x /usr/local/sbin/penguin-sound ] && [ -e /dev/snd/controlC0 ] || return 0
+	v=$(/usr/local/sbin/penguin-sound volume "${VOLUME:-50}" 2>&1) && p_log hw "sound: volume $v %" ||
+		p_log hw "sound: $v"
 	return 0
 }
 

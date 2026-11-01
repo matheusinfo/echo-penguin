@@ -1,0 +1,12 @@
+# echo-penguin root filesystem: busybox init (replaces TECHO5's, with the screen added).
+#
+# boot.sh brings the device up (devices, screen, sound, network, clock, SSH, slot trial);
+# techo5-run is the service supervisor, restarted whenever it exits; techo5-console is the root
+# shell on the USB serial port; penguin-ui is the touch interface on the panel (tty1), restarted if
+# it ever exits (SCREEN_UI=0 leaves it idle).
+::sysinit:/etc/techo5/boot.sh
+::respawn:/usr/local/sbin/techo5-run
+::respawn:/usr/local/sbin/techo5-console
+tty1::respawn:/usr/local/bin/penguin-ui
+::ctrlaltdel:/sbin/reboot
+::shutdown:/etc/techo5/shutdown.sh

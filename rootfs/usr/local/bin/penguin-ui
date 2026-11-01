@@ -1,0 +1,731 @@
+#!/usr/bin/python3
+"""penguin-ui — echo-penguin's touch screen, on the panel's text console.
+
+Started by init on tty1 (/etc/inittab). It draws with plain text and box characters on the
+framebuffer console (80x21 cells of 12x22 pixels, rotated by the kernel), so there is no graphics
+stack: Python's standard library only. Touches come from the goodix-ts input device, the volume
+buttons from gpio-keys.
+
+Screens: home (a large clock and six buttons), Logs (the log console, tty2: kernel errors, boot log
+and mirrored SSH/USB sessions, read back through /dev/vcs2 and shown under the header), System,
+Network & SSH, Clock (alarm, stopwatch, timer), Installed, Display & sound.
+"""
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import time
+
+COLS, ROWS = 80, 21
+CELL_W, CELL_H = 12, 22          # SUN12x22, the console font (kernel/patches/0003)
+PANEL_SHORT = 480                # the panel is 480x960 portrait, mounted sideways
+VT_UI, VT_LOG = 1, 2
+DATA = '/data/penguin'
+ALARM_FILE = DATA + '/alarm.json'
+SETTINGS = ('/etc/penguin/defaults.conf', DATA + '/settings.conf')
+
+EV_KEY, EV_ABS = 1, 3
+ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x35, 0x36, 0x39
+KEY_VOLUMEDOWN, KEY_VOLUMEUP = 114, 115
+EVENT = struct.Struct('llHHi')   # struct input_event as a 32-bit process sees it (16 bytes)
+
+# Big digits for the clocks: 5 rows, 5 columns each, full blocks.
+DIGITS = {
+    '0': ['█████', '█   █', '█   █', '█   █', '█████'],
+    '1': ['  ██ ', '   █ ', '   █ ', '   █ ', '  ███'],
+    '2': ['█████', '    █', '█████', '█    ', '█████'],
+    '3': ['█████', '    █', ' ████', '    █', '█████'],
+    '4': ['█   █', '█   █', '█████', '    █', '    █'],
+    '5': ['█████', '█    ', '█████', '    █', '█████'],
+    '6': ['█████', '█    ', '█████', '█   █', '█████'],
+    '7': ['█████', '    █', '   █ ', '  █  ', '  █  '],
+    '8': ['█████', '█   █', '█████', '█   █', '█████'],
+    '9': ['█████', '█   █', '█████', '    █', '█████'],
+    ':': ['   ', ' █ ', '   ', ' █ ', '   '],
+    '.': ['  ', '  ', '  ', '  ', ' █'],
+}
+
+
+def big(text):
+    """Five lines of large characters for digits, ':' and '.'."""
+    rows = [''] * 5
+    for ch in text:
+        glyph = DIGITS.get(ch, ['     '] * 5)
+        for i in range(5):
+            rows[i] += glyph[i] + ' '
+    return [r.rstrip() for r in rows]
+
+
+def sh(cmd, timeout=4):
+    """Output of a command, '' when it fails or is missing."""
+    try:
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
+def read(path, default=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def settings():
+    values = {}
+    for path in SETTINGS:
+        for line in read(path).splitlines():
+            m = re.match(r'^([A-Z_][A-Z0-9_]*)=("?)(.*?)\2\s*(#.*)?$', line)
+            if m:
+                values[m.group(1)] = m.group(3)
+    return values
+
+
+def human(n):
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return ('%.0f %s' if unit in ('B', 'KB') else '%.1f %s') % (n, unit)
+        n /= 1024.0
+
+
+def input_device(name):
+    for ev in sorted(os.listdir('/sys/class/input')):
+        if ev.startswith('event') and read('/sys/class/input/%s/device/name' % ev) == name:
+            return '/dev/input/' + ev
+    return None
+
+
+# --- Screen: a cell buffer, written to the console a changed line at a time.
+
+class Screen:
+    def __init__(self, tty):
+        self.out = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
+        self.prev = [None] * ROWS
+        self.clear()
+        # Cursor off, no line wrap, auto-repeat irrelevant; never blank.
+        self.write('\033[?25l\033[?7l\033[9;0]\033[2J')
+
+    def write(self, s):
+        data = s.encode('utf-8')
+        while data:
+            n = os.write(self.out, data)
+            data = data[n:]
+
+    def clear(self):
+        self.cells = [[(' ', 0)] * COLS for _ in range(ROWS)]
+
+    def text(self, row, col, s, attr=0):
+        if not 0 <= row < ROWS:
+            return
+        for i, ch in enumerate(s):
+            c = col + i
+            if 0 <= c < COLS:
+                self.cells[row][c] = (ch, attr)
+
+    def center(self, row, s, attr=0, col=0, width=COLS):
+        self.text(row, col + max(0, (width - len(s)) // 2), s, attr)
+
+    def fill(self, row, attr, col=0, width=COLS):
+        self.text(row, col, ' ' * width, attr)
+
+    def box(self, row, col, h, w, label, attr=0, sub=''):
+        """A button: a frame with its label centered (attr 1 = reverse video, for a pressed one)."""
+        self.text(row, col, '┌' + '─' * (w - 2) + '┐', attr)
+        for r in range(row + 1, row + h - 1):
+            self.text(r, col, '│' + ' ' * (w - 2) + '│', attr)
+        self.text(row + h - 1, col, '└' + '─' * (w - 2) + '┘', attr)
+        mid = row + (h - 1) // 2 - (1 if sub else 0)
+        self.center(mid, label, attr | 2, col, w)
+        if sub:
+            self.center(mid + 1, sub, attr, col, w)
+
+    def flush(self, force=False):
+        if force:
+            self.prev = [None] * ROWS
+        out = []
+        for r, cells in enumerate(self.cells):
+            if cells == self.prev[r]:
+                continue
+            self.prev[r] = list(cells)
+            line, cur = ['\033[%d;1H\033[0m' % (r + 1)], 0
+            for ch, attr in cells:
+                if attr != cur:
+                    line.append('\033[0' + (';7' if attr & 1 else '') + (';1' if attr & 2 else '') + 'm')
+                    cur = attr
+                line.append(ch)
+            out.append(''.join(line))
+        if out:
+            self.write(''.join(out) + '\033[0m')
+
+
+# --- Data for the info screens.
+
+def ip_of(dev='wlan0'):
+    m = re.search(r'inet (\S+)', sh(['ip', '-4', '-o', 'addr', 'show', dev]))
+    return m.group(1) if m else ''
+
+
+def system_info():
+    mem = {}
+    for line in read('/proc/meminfo').splitlines():
+        k, _, v = line.partition(':')
+        mem[k] = int(v.split()[0]) * 1024 if v.split() else 0
+    up = float(read('/proc/uptime', '0').split()[0])
+    lines = [
+        ('Host', '%s  (%s)' % (socket.gethostname(), read('/etc/techo5-release'))),
+        ('Kernel', '%s, %s kernel, slot %s' % (os.uname().release,
+                                                 'docker' if 'cpuset' in read('/proc/cgroups') else 'safe',
+                                                 read('/run/techo5/slot', '?'))),
+        ('Uptime', '%d d %02d h %02d min' % (up // 86400, up % 86400 // 3600, up % 3600 // 60)),
+        ('CPU', '%s C, load %s, cores online %s' % (
+            int(read('/sys/class/thermal/thermal_zone%s/temp' % settings().get('TEMP_ZONE', '12'), '0')) // 1000,
+            ' '.join(read('/proc/loadavg').split()[:3]), read('/sys/devices/system/cpu/online'))),
+        ('RAM', '%s used of %s, %s available' % (human(mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)),
+                                                 human(mem.get('MemTotal', 0)), human(mem.get('MemAvailable', 0)))),
+        ('Swap', '%s used of %s (zram)' % (human(mem.get('SwapTotal', 0) - mem.get('SwapFree', 0)),
+                                           human(mem.get('SwapTotal', 0)))),
+    ]
+    for label, path in (('Data', '/data'), ('Slots', '/store'), ('Root', '/')):
+        try:
+            u = shutil.disk_usage(path)
+            lines.append((label, '%s free of %s  (%s)' % (human(u.free), human(u.total), path)))
+        except OSError:
+            pass
+    lines += network_lines()[:3]
+    return lines
+
+
+def wifi_link():
+    link = sh(['iw', 'dev', 'wlan0', 'link'])
+    ssid = re.search(r'SSID: (.*)', link)
+    sig = re.search(r'signal: (-?\d+) dBm', link)
+    freq = re.search(r'freq: (\d+)', link)
+    if not ssid:
+        return 'not connected'
+    s = ssid.group(1)
+    if sig:
+        s += ', %s dBm' % sig.group(1)
+    if freq:
+        s += ', %.1f GHz' % (int(freq.group(1)) / 1000)
+    return s
+
+
+def network_lines():
+    route = re.search(r'default via (\S+)', sh(['ip', 'route', 'show', 'default']))
+    dns = re.findall(r'^nameserver (\S+)', read('/etc/resolv.conf'), re.M)
+    return [
+        ('IP', ip_of() or 'none'),
+        ('Wi-Fi', wifi_link()),
+        ('Gateway', route.group(1) if route else 'none'),
+        ('DNS', ' '.join(dns[:2]) or 'none'),
+    ]
+
+
+def key_fingerprint(line):
+    parts = line.split()
+    for i, p in enumerate(parts):
+        if p.startswith(('ssh-', 'ecdsa-', 'sk-')) and i + 1 < len(parts):
+            try:
+                blob = base64.b64decode(parts[i + 1])
+            except ValueError:
+                return None
+            fp = base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
+            return p, 'SHA256:' + fp, ' '.join(parts[i + 2:]) or '(no comment)'
+    return None
+
+
+def ssh_lines():
+    ip = (ip_of() or '?').split('/')[0]
+    running = bool(sh(['pidof', 'dropbear']))
+    keys = [k for k in (key_fingerprint(l) for l in read('/data/misc/techo5/ssh/authorized_keys').splitlines()) if k]
+    host = ''
+    for f in ('/etc/dropbear/dropbear_ed25519_host_key', '/data/techo5-linux/dropbear/dropbear_ed25519_host_key'):
+        m = re.search(r'Fingerprint: (\S+)', sh(['dropbearkey', '-y', '-f', f]))
+        if m:
+            host = m.group(1)
+            break
+    lines = [
+        ('SSH', 'running (dropbear, port 22, keys only)' if running else 'NOT running'),
+        ('Connect', 'ssh root@%s' % ip),
+        ('Name', socket.gethostname()),
+        ('Host key', host or 'unknown'),
+        ('Keys', '%d authorized key(s)' % len(keys) if keys else 'NONE: nobody can log in over SSH'),
+    ]
+    for kind, fp, comment in keys[:4]:
+        lines.append(('', '%s  %s' % (comment[:24], fp[:39])))
+    lines.append(('Firewall', 'Wi-Fi inbound: SSH only%s' % (
+        ', +' + settings().get('LAN_PORTS') if settings().get('LAN_PORTS') else '')))
+    return lines
+
+
+def installed_lines():
+    apk = {}
+    for line in sh(['apk', 'info', '-v'], 8).splitlines():
+        m = re.match(r'^(.*)-(\d[^-]*-r\d+)$', line)
+        if m:
+            apk[m.group(1)] = m.group(2)
+    docker = sh(['docker', 'version', '--format', '{{.Server.Version}}'], 6)
+    lines = [
+        ('System', '%s, Alpine %s' % (read('/etc/techo5-release').split(' built')[0], read('/etc/alpine-release'))),
+        ('Kernel', os.uname().release + (', Docker support' if 'cpuset' in read('/proc/cgroups') else ', no Docker')),
+    ]
+    if docker:
+        running = len(sh(['docker', 'ps', '-q'], 6).split())
+        images = len(sh(['docker', 'images', '-q'], 6).split())
+        lines.append(('Docker', '%s: %d running, %d image(s)' % (docker, running, images)))
+    else:
+        lines.append(('Docker', 'not running' if 'cpuset' in read('/proc/cgroups') else 'off (safe kernel)'))
+    for label, pkgs in (('Containers', ('containerd', 'runc', 'docker-cli-compose')),
+                        ('SSH', ('dropbear', 'openssh-sftp-server')),
+                        ('Network', ('iw', 'iptables', 'curl')),
+                        ('Tools', ('python3', 'alsa-utils', 'htop'))):
+        have = ['%s %s' % (p, apk[p].split('-r')[0]) for p in pkgs if p in apk]
+        if have:
+            lines.append((label, ', '.join(have)))
+    wpa = sh('wpa_supplicant -v 2>&1 | head -1')
+    if wpa:
+        lines.append(('Wi-Fi', wpa))
+    lines.append(('Packages', '%d installed (apk info)' % len(apk)))
+    return lines
+
+
+# --- Alarm, stopwatch and timer state.
+
+class Clocks:
+    def __init__(self):
+        self.alarm = {'on': False, 'h': 7, 'm': 0}
+        try:
+            with open(ALARM_FILE) as f:
+                self.alarm.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+        self.fired = None
+        self.ringing = None          # what rings: 'alarm' | 'timer'
+        self.ring_since = 0
+        self.sw_start = None         # stopwatch
+        self.sw_acc = 0.0
+        self.timer_set = 300         # timer, seconds
+        self.timer_end = None
+        self.timer_left = 300
+
+    def save(self):
+        try:
+            os.makedirs(DATA, exist_ok=True)
+            with open(ALARM_FILE + '.tmp', 'w') as f:
+                json.dump(self.alarm, f)
+            os.rename(ALARM_FILE + '.tmp', ALARM_FILE)
+        except OSError:
+            pass
+
+    def stopwatch(self):
+        return self.sw_acc + (time.time() - self.sw_start if self.sw_start else 0)
+
+    def timer(self):
+        return max(0, self.timer_end - time.time()) if self.timer_end else self.timer_left
+
+    def tick(self):
+        """Start ringing when the alarm or the timer is due."""
+        now = time.localtime()
+        key = (now.tm_yday, now.tm_hour, now.tm_min)
+        if self.alarm['on'] and (now.tm_hour, now.tm_min) == (self.alarm['h'], self.alarm['m']) and self.fired != key:
+            self.fired = key
+            self.ring('alarm')
+        if self.timer_end and time.time() >= self.timer_end:
+            self.timer_end = None
+            self.timer_left = self.timer_set
+            self.ring('timer')
+
+    def ring(self, what):
+        self.ringing = what
+        self.ring_since = time.time()
+
+    def until_alarm(self):
+        now = time.localtime()
+        mins = (self.alarm['h'] * 60 + self.alarm['m']) - (now.tm_hour * 60 + now.tm_min)
+        if mins <= 0:
+            mins += 24 * 60
+        return '%d h %02d min' % (mins // 60, mins % 60)
+
+
+# --- The application.
+
+class App:
+    def __init__(self):
+        self.scr = Screen('/dev/tty%d' % VT_UI)
+        self.tty0 = os.open('/dev/tty0', os.O_RDWR | os.O_NOCTTY)
+        self.touch = self.open_input('goodix-ts')
+        self.keys = self.open_input('gpio-keys')
+        self.view = 'home'
+        self.tab = 'alarm'
+        self.buttons = []
+        self.pressed = None
+        self.info = []
+        self.info_at = 0
+        self.toast = ''
+        self.toast_until = 0
+        self.dark = False
+        self.clocks = Clocks()
+        self.beep_at = 0
+        self.tx = self.ty = None
+        self.chvt(VT_UI)
+
+    def open_input(self, name):
+        path = input_device(name)
+        return os.open(path, os.O_RDONLY | os.O_NONBLOCK) if path else None
+
+    def chvt(self, n):
+        try:
+            fcntl.ioctl(self.tty0, 0x5606, n)  # VT_ACTIVATE
+            fcntl.ioctl(self.tty0, 0x5607, n)  # VT_WAITACTIVE
+        except OSError:
+            pass
+
+    def say(self, msg, secs=2.5):
+        self.toast, self.toast_until = msg, time.time() + secs
+
+    # Settings that persist go through `penguin set`, so `penguin settings` shows them.
+    def set_setting(self, key, value):
+        sh(['penguin', 'set', key, str(value)])
+
+    def backlight(self, level=None):
+        f = '/sys/class/leds/lcd-backlight/brightness'
+        if level is None:
+            return int(read(f, '90') or 90)
+        try:
+            with open(f, 'w') as fh:
+                fh.write(str(level))
+        except OSError:
+            pass
+
+    # Drawing -------------------------------------------------------------------------------
+
+    def header(self, title):
+        s = self.scr
+        s.fill(0, 1)
+        now = time.strftime('%a %d %b  %H:%M')
+        if self.view == 'home':
+            s.text(0, 1, ' echo-penguin ', 3)
+            s.text(0, 16, socket.gethostname(), 1)
+        else:
+            s.text(0, 0, ' < Back ', 3)
+            self.buttons.append((0, 0, 2, 12, 'back'))  # two rows: the panel's top edge reads as row 1
+            s.text(0, 11, title, 3)
+            if self.view == 'logs':
+                s.text(0, 44, ' System ', 3)
+                self.buttons.append((0, 42, 2, 12, 'system'))
+        s.text(0, COLS - len(now) - 1, now, 1)
+
+    def footer(self, text):
+        s = self.scr
+        if self.toast and time.time() < self.toast_until:
+            text = self.toast
+        s.fill(ROWS - 1, 0)
+        s.center(ROWS - 1, text[:COLS])
+
+    def button(self, row, col, h, w, label, action, sub=''):
+        self.scr.box(row, col, h, w, label, 1 if self.pressed == action else 0, sub)
+        self.buttons.append((row, col, h, w, action))
+
+    def kv(self, lines, top=2):
+        s = self.scr
+        for i, (k, v) in enumerate(lines[:ROWS - top - 2]):
+            s.text(top + i, 2, ('%-9s' % k)[:9], 2)
+            s.text(top + i, 12, str(v)[:COLS - 13])
+
+    def draw(self):
+        s = self.scr
+        s.clear()
+        self.buttons = []
+        if self.dark:
+            s.flush()
+            return
+        if self.clocks.ringing:
+            self.draw_ringing()
+        else:
+            getattr(self, 'draw_' + self.view)()
+        s.flush()
+
+    def draw_home(self):
+        s = self.scr
+        self.header('')
+        for i, line in enumerate(big(time.strftime('%H:%M:%S'))):
+            s.center(2 + i, line, 2)
+        status = time.strftime('%A, %d %B %Y')
+        if self.clocks.alarm['on']:
+            status += '   ·   alarm %02d:%02d' % (self.clocks.alarm['h'], self.clocks.alarm['m'])
+        s.center(8, status)
+        w, gap = 25, 1
+        x0 = (COLS - 3 * w - 2 * gap) // 2
+        ip = (ip_of() or 'no network').split('/')[0]
+        items = [('Logs', 'logs', 'kernel, boot, sessions'), ('System', 'system', 'CPU, RAM, storage'),
+                 ('Network & SSH', 'ssh', ip),
+                 ('Clock', 'clock', 'alarm, stopwatch, timer'), ('Installed', 'installed', 'Docker, packages'),
+                 ('Display & sound', 'display', 'brightness, volume')]
+        for i, (label, action, sub) in enumerate(items):
+            row = 10 + (i // 3) * 5
+            col = x0 + (i % 3) * (w + gap)
+            self.button(row, col, 5, w, label, action, sub)
+        self.footer('tap a button')
+
+    def draw_info(self, title, fn, every=5):
+        if time.time() - self.info_at > every:
+            self.info, self.info_at = fn(), time.time()
+        self.header(title)
+        self.kv(self.info)
+        self.footer('updated every %d s' % every)
+
+    def draw_logs(self):
+        s = self.scr
+        self.header('Logs')
+        try:
+            with open('/dev/vcs%d' % VT_LOG, 'rb') as f:
+                raw = f.read()
+        except OSError:
+            raw = b''
+        text = raw.decode('cp437', 'replace')
+        lines = [text[i:i + COLS].rstrip() for i in range(0, len(text), COLS)]
+        while lines and not lines[-1]:
+            lines.pop()
+        shown = lines[-(ROWS - 2):]
+        for i, line in enumerate(shown):
+            s.text(1 + i, 0, line)
+        self.footer('kernel errors, boot log and SSH/USB sessions, newest at the bottom')
+
+    def draw_system(self):
+        self.draw_info('System', system_info, 3)
+
+    def draw_ssh(self):
+        self.draw_info('Network & SSH', lambda: network_lines() + [('', '')] + ssh_lines(), 5)
+
+    def draw_installed(self):
+        self.draw_info('Installed', installed_lines, 30)
+
+    def draw_display(self):
+        s = self.scr
+        self.header('Display & sound')
+        bl = self.backlight()
+        vol = sh(['penguin-sound', 'volume']) or '?'
+        s.text(3, 4, 'Brightness', 2)
+        s.text(3, 20, '%3d / 255' % bl)
+        self.button(5, 4, 3, 16, '-', 'bl-')
+        self.button(5, 22, 3, 16, '+', 'bl+')
+        s.text(3, 44, 'Volume', 2)
+        s.text(3, 60, '%s %%' % vol)
+        self.button(5, 44, 3, 16, '-', 'vol-')
+        self.button(5, 62, 3, 16, '+', 'vol+')
+        self.button(10, 4, 3, 34, 'Test sound', 'beep')
+        self.button(10, 44, 3, 34, 'Screen off', 'dark')
+        s.text(15, 4, 'Screen off: the panel goes dark; a tap brings it back.')
+        s.text(16, 4, 'The volume buttons on top of the Echo change the volume too.')
+        s.text(17, 4, 'Both are kept across reboots (penguin settings).')
+        self.footer('')
+
+    def draw_clock(self):
+        s = self.scr
+        c = self.clocks
+        self.header('Clock')
+        for i, (label, tab) in enumerate((('Alarm', 'alarm'), ('Stopwatch', 'stopwatch'), ('Timer', 'timer'))):
+            self.scr.box(2, 2 + i * 26, 3, 24, label, 1 if self.tab == tab else 0)
+            self.buttons.append((2, 2 + i * 26, 3, 24, 'tab-' + tab))
+        if self.tab == 'alarm':
+            for i, line in enumerate(big('%02d:%02d' % (c.alarm['h'], c.alarm['m']))):
+                s.center(6 + i, line, 2)
+            for i, (label, action) in enumerate((('Hour +', 'h+'), ('Hour -', 'h-'), ('Min +10', 'm+10'),
+                                                 ('Min +1', 'm+'), ('Min -1', 'm-'))):
+                self.button(12, 2 + i * 15, 3, 14, label, action)
+            self.button(15, 2, 3, 37, 'Alarm is ON' if c.alarm['on'] else 'Alarm is OFF', 'alarm-toggle')
+            self.button(15, 41, 3, 37, 'Test sound', 'beep')
+            self.footer('rings in %s' % c.until_alarm() if c.alarm['on'] else 'alarm off')
+        elif self.tab == 'stopwatch':
+            t = c.stopwatch()
+            for i, line in enumerate(big('%02d:%02d.%d' % (t // 60, t % 60, (t * 10) % 10))):
+                s.center(7 + i, line, 2)
+            self.button(14, 6, 4, 32, 'Stop' if c.sw_start else 'Start', 'sw-toggle')
+            self.button(14, 42, 4, 32, 'Reset', 'sw-reset')
+            self.footer('')
+        else:
+            t = c.timer()
+            for i, line in enumerate(big('%02d:%02d' % (t // 60, t % 60))):
+                s.center(6 + i, line, 2)
+            for i, (label, action) in enumerate((('+1 min', 't+60'), ('+5 min', 't+300'), ('-1 min', 't-60'))):
+                self.button(12, 2 + i * 26, 3, 24, label, action)
+            self.button(15, 2, 3, 37, 'Stop' if c.timer_end else 'Start', 't-toggle')
+            self.button(15, 41, 3, 37, 'Reset', 't-reset')
+            self.footer('timer running' if c.timer_end else '')
+
+    def draw_ringing(self):
+        s = self.scr
+        what = 'ALARM' if self.clocks.ringing == 'alarm' else 'TIMER'
+        for r in range(ROWS):
+            s.fill(r, 1)
+        s.center(3, what, 3)
+        for i, line in enumerate(big(time.strftime('%H:%M'))):
+            s.center(6 + i, line, 3)
+        s.center(14, 'tap anywhere to stop', 3)
+        self.buttons.append((0, 0, ROWS, COLS, 'stop-ring'))
+
+    # Actions -------------------------------------------------------------------------------
+
+    def act(self, action):
+        c = self.clocks
+        if action == 'stop-ring':
+            c.ringing = None
+        elif action == 'back':
+            self.view = 'home'
+        elif action in ('logs', 'system', 'ssh', 'installed', 'display', 'clock'):
+            self.view, self.info_at = action, 0
+        elif action.startswith('tab-'):
+            self.tab = action[4:]
+        elif action in ('h+', 'h-'):
+            c.alarm['h'] = (c.alarm['h'] + (1 if action == 'h+' else -1)) % 24
+            c.save()
+        elif action in ('m+', 'm-', 'm+10'):
+            c.alarm['m'] = (c.alarm['m'] + {'m+': 1, 'm-': -1, 'm+10': 10}[action]) % 60
+            c.save()
+        elif action == 'alarm-toggle':
+            c.alarm['on'] = not c.alarm['on']
+            c.save()
+            self.say('alarm on: rings in %s' % c.until_alarm() if c.alarm['on'] else 'alarm off')
+        elif action == 'sw-toggle':
+            if c.sw_start:
+                c.sw_acc += time.time() - c.sw_start
+                c.sw_start = None
+            else:
+                c.sw_start = time.time()
+        elif action == 'sw-reset':
+            c.sw_start, c.sw_acc = None, 0.0
+        elif action in ('t+60', 't+300', 't-60'):
+            if not c.timer_end:
+                c.timer_set = max(60, min(99 * 60, c.timer_set + int(action[1:])))
+                c.timer_left = c.timer_set
+        elif action == 't-toggle':
+            if c.timer_end:
+                c.timer_left, c.timer_end = c.timer(), None
+            else:
+                c.timer_end = time.time() + c.timer_left
+        elif action == 't-reset':
+            c.timer_end, c.timer_left = None, c.timer_set
+        elif action in ('bl-', 'bl+'):
+            level = max(10, min(255, self.backlight() + (20 if action == 'bl+' else -20)))
+            self.backlight(level)
+            self.set_setting('BACKLIGHT', level)
+        elif action in ('vol-', 'vol+'):
+            self.volume(10 if action == 'vol+' else -10)
+        elif action == 'beep':
+            subprocess.Popen(['penguin-sound', 'beep', '880', '250', '2'])
+        elif action == 'dark':
+            self.dark = True
+            self.saved_bl = self.backlight()
+            self.backlight(0)
+
+    def volume(self, delta):
+        cur = sh(['penguin-sound', 'volume'])
+        if not cur.isdigit():
+            self.say('no volume control')
+            return
+        new = max(0, min(100, int(cur) + delta))
+        sh(['penguin-sound', 'volume', str(new)])
+        self.set_setting('VOLUME', new)
+        self.say('volume %d %%' % new)
+        subprocess.Popen(['penguin-sound', 'beep', '880', '120'])
+
+    def tap(self, x, y):
+        # Touch coordinates are the panel's portrait axes; the screen is that turned 90 degrees.
+        sx, sy = y, PANEL_SHORT - x
+        col, row = min(COLS - 1, max(0, sx // CELL_W)), min(ROWS - 1, max(0, sy // CELL_H))
+        if self.dark:
+            self.dark = False
+            self.backlight(getattr(self, 'saved_bl', 90))
+            self.scr.flush(force=True)
+            return
+        if os.environ.get('PENGUIN_UI_DEBUG'):
+            with open('/run/penguin/ui-taps.log', 'a') as f:
+                f.write('touch %d,%d -> row %d col %d\n' % (x, y, row, col))
+        # A finger is wider than a cell, and the panel's edges read a little inside: take the button
+        # under the tap, else the nearest one within a cell.
+        best, dist = None, 2
+        for r, c, h, w, action in self.buttons:
+            d = max(r - row if row < r else row - (r + h - 1) if row >= r + h else 0,
+                    c - col if col < c else col - (c + w - 1) if col >= c + w else 0)
+            if d < dist:
+                best, dist = action, d
+        if best:
+            self.pressed = best
+            self.draw()
+            time.sleep(0.08)
+            self.pressed = None
+            self.act(best)
+
+    # Input and the main loop ---------------------------------------------------------------
+
+    def read_touch(self):
+        try:
+            data = os.read(self.touch, EVENT.size * 64)
+        except BlockingIOError:
+            return
+        for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, etype, code, value = EVENT.unpack_from(data, i)
+            if etype != EV_ABS:
+                continue
+            if code == ABS_MT_POSITION_X:
+                self.tx = value
+            elif code == ABS_MT_POSITION_Y:
+                self.ty = value
+            elif code == ABS_MT_TRACKING_ID and value == -1 and self.tx is not None:
+                self.tap(self.tx, self.ty)  # on release: a tap
+                self.tx = self.ty = None
+                self.draw()
+
+    def read_keys(self):
+        try:
+            data = os.read(self.keys, EVENT.size * 16)
+        except BlockingIOError:
+            return
+        for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, etype, code, value = EVENT.unpack_from(data, i)
+            if etype == EV_KEY and value == 1 and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
+                if self.clocks.ringing:
+                    self.clocks.ringing = None
+                else:
+                    self.volume(10 if code == KEY_VOLUMEUP else -10)
+                self.draw()
+
+    def run(self):
+        fds = [fd for fd in (self.touch, self.keys) if fd is not None]
+        while True:
+            self.clocks.tick()
+            if self.clocks.ringing:
+                if self.dark:
+                    self.dark = False
+                    self.backlight(getattr(self, 'saved_bl', 90))
+                if time.time() - self.clocks.ring_since > 600:
+                    self.clocks.ringing = None  # ten minutes is enough
+                elif time.time() - self.beep_at > 1.5:
+                    self.beep_at = time.time()
+                    subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
+            self.draw()
+            fast = self.view == 'clock' and self.tab == 'stopwatch' and self.clocks.sw_start
+            r, _, _ = select.select(fds, [], [], 0.1 if fast else 1 - time.time() % 1)
+            if self.touch in r:
+                self.read_touch()
+            if self.keys in r:
+                self.read_keys()
+
+
+if __name__ == '__main__':
+    # Started by busybox init, whose PATH has no /usr/local: penguin and penguin-sound live there.
+    os.environ['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    if settings().get('SCREEN_UI', '1') != '1':
+        # SCREEN_UI=0: tty1 stays the log console (init respawns this entry, so idle instead of exiting).
+        while True:
+            time.sleep(3600)
+    App().run()

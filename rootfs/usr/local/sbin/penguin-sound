@@ -1,0 +1,132 @@
+#!/usr/bin/python3
+"""penguin-sound — the speaker, safely.
+
+    penguin-sound beep [HZ [MS [COUNT]]]   a tone (default 880 Hz, 200 ms, once)
+    penguin-sound play FILE.wav            any WAV (converted by ALSA's plug layer)
+    penguin-sound volume [PERCENT]         show or set the amplifier volume (0-100)
+
+Playback is the MediaTek AFE's DL1 path, card 0 device 23 (S16_LE, stereo, 48 kHz). Two rules from
+TECHO5's docs/hardware.md, both found the hard way on cronos:
+  - another AFE PCM node must be held open while device 23 plays: with none, the driver puts its ring
+    in the AFE's SRAM and the first copy into it panics the kernel. /dev/snd/pcmC0D1c (an unused
+    capture) is held open, unconfigured, for the whole playback.
+  - never touch Ext_Speaker_Amp_Switch: on cronos it resets the amplifier, which then stays silent
+    until a reboot. Volume goes through the amplifier's own digital volume only.
+"""
+import fcntl
+import math
+import os
+import struct
+import subprocess
+import sys
+import wave
+
+HOLD = '/dev/snd/pcmC0D1c'
+DEVICE = 'hw:0,23'
+RUN = '/run/penguin'
+# Volume controls by amplifier, as the kernel names them (cat /sys/bus/i2c/devices/2-*/name).
+VOLUME_CONTROLS = ('Master TAS5805m Playback Volume A',  # TI TAS5805M
+                   'Digital Volume A')                    # Maxim MAX98396
+MAX98396_SAFE_MODE = 'Speaker Safe Mode A'  # a ~30 dB power cap the MAX98396 comes up with
+
+
+def amixer(*args, check=False):
+    r = subprocess.run(['amixer', '-q', '-D', 'hw:0'] + list(args), capture_output=True, text=True, timeout=5)
+    if check and r.returncode:
+        raise RuntimeError(r.stderr.strip())
+    return r
+
+
+def control_range(name):
+    """(min, max, current) of an integer mixer control, or None when the card has no such control."""
+    r = subprocess.run(['amixer', '-D', 'hw:0', 'cget', 'name=' + name], capture_output=True, text=True, timeout=5)
+    if r.returncode:
+        return None
+    lo = hi = cur = None
+    for part in r.stdout.replace(',', ' ').split():
+        if part.startswith('min='):
+            lo = int(part[4:])
+        elif part.startswith('max='):
+            hi = int(part[4:])
+        elif part.startswith('values='):
+            cur = int(part[7:])
+    return None if hi is None else (lo or 0, hi, cur)
+
+
+def volume(percent=None):
+    for name in VOLUME_CONTROLS:
+        rng = control_range(name)
+        if rng is None:
+            continue
+        lo, hi, cur = rng
+        if percent is None:
+            return round(100 * (cur - lo) / (hi - lo)) if cur is not None else None
+        percent = max(0, min(100, int(percent)))
+        amixer('cset', 'name=' + name, str(lo + round((hi - lo) * percent / 100)), check=True)
+        if name == 'Digital Volume A' and control_range(MAX98396_SAFE_MODE):
+            amixer('cset', 'name=' + MAX98396_SAFE_MODE, '0')
+        return percent
+    raise RuntimeError('no known amplifier volume control on card 0')
+
+
+def tone(hz, ms, path):
+    rate, n = 48000, int(48000 * ms / 1000)
+    ramp = max(1, min(n // 4, 480))  # 10 ms fades: no clicks
+    frames = bytearray()
+    for i in range(n):
+        env = min(1.0, i / ramp, (n - i) / ramp)
+        v = int(0.25 * 32767 * env * math.sin(2 * math.pi * hz * i / rate))
+        frames += struct.pack('<hh', v, v)
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def play(path, device):
+    os.makedirs(RUN, exist_ok=True)
+    with open(os.path.join(RUN, 'sound.lock'), 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0  # something is already playing: skip rather than queue
+        hold = os.open(HOLD, os.O_RDONLY)  # the SRAM-ring workaround, see the top of this file
+        try:
+            return subprocess.run(['aplay', '-q', '-D', device, '--period-size=768', '--buffer-size=3072', path],
+                                  timeout=600).returncode
+        finally:
+            os.close(hold)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else 'beep'
+    if cmd == 'beep':
+        hz = int(argv[2]) if len(argv) > 2 else 880
+        ms = int(argv[3]) if len(argv) > 3 else 200
+        count = int(argv[4]) if len(argv) > 4 else 1
+        os.makedirs(RUN, exist_ok=True)
+        path = os.path.join(RUN, 'beep-%d-%d.wav' % (hz, ms))
+        if not os.path.exists(path):
+            tone(hz, ms, path + '.tmp')
+            os.rename(path + '.tmp', path)
+        for _ in range(count):
+            rc = play(path, DEVICE)
+            if rc:
+                return rc
+        return 0
+    if cmd == 'play' and len(argv) > 2:
+        return play(argv[2], 'plug' + DEVICE)
+    if cmd == 'volume':
+        print(volume(argv[2] if len(argv) > 2 else None))
+        return 0
+    print(__doc__.split('\n\n')[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv))
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+        print('penguin-sound: %s' % e, file=sys.stderr)
+        sys.exit(1)
