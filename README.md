@@ -184,10 +184,11 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 
 **The screen.** The home screen shows the time and six buttons: **Logs** (kernel errors, the boot
 log and every interactive SSH or USB-console session, live), **System**, **Network & SSH**,
-**Clock** (alarm, stopwatch, timer), **Installed** and **Display & sound** (brightness, volume,
-screen off). `< Back` returns. The volume buttons on top change the volume, or stop a ringing alarm.
-The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on the kernel's
-framebuffer console, Python's standard library only.
+**Clock** (an alarm that repeats every day, on weekdays or weekends, or rings once; a stopwatch;
+a timer), **Installed** and **Display & sound** (brightness, volume, screen off). `< Back`
+returns. The volume buttons on top change the volume, or stop a ringing alarm. The interface is
+[penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on the kernel's framebuffer console,
+Python's standard library only.
 
 **Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav`,
 `penguin-sound volume [0-100]`. It holds the workaround the MediaTek playback driver needs (without

@@ -332,14 +332,20 @@ def installed_lines():
 
 # --- Alarm, stopwatch and timer state.
 
+# The alarm's repeat modes, in the order the Repeat button cycles through them.
+REPEATS = {'daily': 'every day', 'weekdays': 'Mon to Fri', 'weekends': 'Sat and Sun', 'once': 'once'}
+
+
 class Clocks:
     def __init__(self):
-        self.alarm = {'on': False, 'h': 7, 'm': 0}
+        self.alarm = {'on': False, 'h': 7, 'm': 0, 'repeat': 'daily'}
         try:
             with open(ALARM_FILE) as f:
                 self.alarm.update(json.load(f))
         except (OSError, ValueError):
             pass
+        if self.alarm.get('repeat') not in REPEATS:
+            self.alarm['repeat'] = 'daily'
         self.fired = None
         self.ringing = None          # what rings: 'alarm' | 'timer'
         self.ring_since = 0
@@ -368,9 +374,13 @@ class Clocks:
         """Start ringing when the alarm or the timer is due."""
         now = time.localtime()
         key = (now.tm_yday, now.tm_hour, now.tm_min)
-        if self.alarm['on'] and (now.tm_hour, now.tm_min) == (self.alarm['h'], self.alarm['m']) and self.fired != key:
+        if (self.alarm['on'] and (now.tm_hour, now.tm_min) == (self.alarm['h'], self.alarm['m'])
+                and self.rings_on(now.tm_wday) and self.fired != key):
             self.fired = key
             self.ring('alarm')
+            if self.alarm['repeat'] == 'once':
+                self.alarm['on'] = False
+                self.save()
         if self.timer_end and time.time() >= self.timer_end:
             self.timer_end = None
             self.timer_left = self.timer_set
@@ -380,12 +390,20 @@ class Clocks:
         self.ringing = what
         self.ring_since = time.time()
 
+    def rings_on(self, wday):
+        """Whether the alarm rings on a weekday (0 = Monday)."""
+        return {'weekdays': wday < 5, 'weekends': wday >= 5}.get(self.alarm['repeat'], True)
+
     def until_alarm(self):
         now = time.localtime()
-        mins = (self.alarm['h'] * 60 + self.alarm['m']) - (now.tm_hour * 60 + now.tm_min)
+        today = now.tm_hour * 60 + now.tm_min
+        mins = (self.alarm['h'] * 60 + self.alarm['m']) - today
         if mins <= 0:
             mins += 24 * 60
-        return '%d h %02d min' % (mins // 60, mins % 60)
+        while not self.rings_on((now.tm_wday + (today + mins) // (24 * 60)) % 7):
+            mins += 24 * 60
+        days, mins = mins // (24 * 60), mins % (24 * 60)
+        return ('%d d ' % days if days else '') + '%d h %02d min' % (mins // 60, mins % 60)
 
 
 # --- The application.
@@ -408,6 +426,7 @@ class App:
         self.clocks = Clocks()
         self.beep_at = 0
         self.tx = self.ty = None
+        self.down = False
         self.confirm, self.confirm_until = None, 0
         self.cooldown_until = 0
         self.chvt(VT_UI)
@@ -495,7 +514,8 @@ class App:
             s.center(2 + i, line, 2)
         status = time.strftime('%A, %d %B %Y')
         if self.clocks.alarm['on']:
-            status += '   ·   alarm %02d:%02d' % (self.clocks.alarm['h'], self.clocks.alarm['m'])
+            status += '   ·   alarm %02d:%02d, %s' % (self.clocks.alarm['h'], self.clocks.alarm['m'],
+                                                    REPEATS[self.clocks.alarm['repeat']])
         s.center(8, status)
         w, gap = 25, 1
         x0 = (COLS - 3 * w - 2 * gap) // 2
@@ -590,9 +610,11 @@ class App:
             for i, (label, action) in enumerate((('Hour +', 'h+'), ('Hour -', 'h-'), ('Min +10', 'm+10'),
                                                  ('Min +1', 'm+'), ('Min -1', 'm-'))):
                 self.button(12, 2 + i * 15, 3, 14, label, action)
-            self.button(15, 2, 3, 37, 'Alarm is ON' if c.alarm['on'] else 'Alarm is OFF', 'alarm-toggle')
-            self.button(15, 41, 3, 37, 'Test sound', 'beep')
-            self.footer('rings in %s' % c.until_alarm() if c.alarm['on'] else 'alarm off')
+            self.button(15, 2, 3, 24, 'Alarm is ON' if c.alarm['on'] else 'Alarm is OFF', 'alarm-toggle')
+            self.button(15, 28, 3, 24, 'Repeat: ' + REPEATS[c.alarm['repeat']], 'alarm-repeat')
+            self.button(15, 54, 3, 24, 'Test sound', 'beep')
+            self.footer('rings in %s, %s' % (c.until_alarm(), REPEATS[c.alarm['repeat']])
+                        if c.alarm['on'] else 'alarm off')
         elif self.tab == 'stopwatch':
             t = c.stopwatch()
             for i, line in enumerate(big('%02d:%02d.%d' % (t // 60, t % 60, (t * 10) % 10))):
@@ -643,6 +665,10 @@ class App:
             c.alarm['on'] = not c.alarm['on']
             c.save()
             self.say('alarm on: rings in %s' % c.until_alarm() if c.alarm['on'] else 'alarm off')
+        elif action == 'alarm-repeat':
+            modes = list(REPEATS)
+            c.alarm['repeat'] = modes[(modes.index(c.alarm['repeat']) + 1) % len(modes)]
+            c.save()
         elif action == 'sw-toggle':
             if c.sw_start:
                 c.sw_acc += time.time() - c.sw_start
@@ -746,9 +772,13 @@ class App:
                 self.tx = value
             elif code == ABS_MT_POSITION_Y:
                 self.ty = value
-            elif code == ABS_MT_TRACKING_ID and value == -1 and self.tx is not None:
-                self.tap(self.tx, self.ty)  # on release: a tap
-                self.tx = self.ty = None
+            elif code == ABS_MT_TRACKING_ID and value != -1:
+                self.down = True
+            elif code == ABS_MT_TRACKING_ID and self.down and None not in (self.tx, self.ty):
+                # On release: a tap. The kernel drops a position equal to the slot's last one, so a
+                # tap on the same spot may bring no X or no Y: tx and ty keep the last values.
+                self.down = False
+                self.tap(self.tx, self.ty)
                 self.draw()
 
     def read_keys(self):

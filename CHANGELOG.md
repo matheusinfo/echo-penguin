@@ -4,6 +4,15 @@ Versions are the root filesystem's (`/etc/techo5-release` on the unit, `-V` of `
 The boot images (kernels) are rebuilt alongside them; the changes to them are listed under the
 version that first needed them. Every version below ran on an Echo Show 5 2nd gen.
 
+## v0.2.6 — 2026-11-01
+
+An alarm that repeats, and taps that no longer crash the screen.
+
+- The alarm repeats every day, Monday to Friday, Saturday and Sunday, or rings once and turns
+  itself off (`Repeat` on the Clock screen). It used to ring every day with no way to tell.
+- Fixed: tapping the same spot over and over (Min +1, Min -1) crashed the interface back to the
+  home screen. The kernel sends no position that equals the last one, and the interface lost it.
+
 ## v0.2.5 — 2026-11-01
 
 SSH you can restrict and switch off.
