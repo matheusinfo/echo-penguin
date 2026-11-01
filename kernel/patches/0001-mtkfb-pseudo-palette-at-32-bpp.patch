@@ -1,0 +1,27 @@
+From: echo-penguin
+Subject: [PATCH] mtkfb: store all 16 pseudo palette entries at 32 bpp
+
+mtkfb_setcolreg() computed its limit as 1 << bits_per_pixel. At 32 bpp that shift is undefined
+and gives 1 on arm64, so every palette entry but 0 was refused and the framebuffer console
+drew its text in color 0: black on black. Limit the entries to the 16 the pseudo palette holds.
+---
+diff --git a/drivers/misc/mediatek/video/mt8163/videox/mtkfb.c b/drivers/misc/mediatek/video/mt8163/videox/mtkfb.c
+index 0b8f880d656..94f8d61c623 100644
+--- a/drivers/misc/mediatek/video/mt8163/videox/mtkfb.c
++++ b/drivers/misc/mediatek/video/mt8163/videox/mtkfb.c
+@@ -259,8 +259,13 @@ static int mtkfb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
+ 	MSG_FUNC_ENTER();
+ 
+ 	bpp = info->var.bits_per_pixel;
+-	m = 1 << bpp;
+-	if (regno >= m) {
++	/*
++	 * 1 << 32 is undefined in C, and on arm64 it gives 1: at 32 bpp every entry but 0 was
++	 * refused, so the framebuffer console drew its text black on black. The pseudo palette
++	 * the console uses has 16 entries.
++	 */
++	m = bpp < 32 ? 1U << bpp : 16;
++	if (regno >= m || regno >= 16) {
+ 		r = -EINVAL;
+ 		goto exit;
+ 	}
