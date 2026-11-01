@@ -35,7 +35,8 @@ eval "$(on '. /lib/penguin.sh; p_settings
 	echo "slot=$(cat /run/techo5/slot 2>/dev/null)"
 	echo "slotstate=\"$(cat /store/slots/$(cat /run/techo5/slot 2>/dev/null).state 2>/dev/null)\""
 	echo "wlan=$(grep -c "^mt76x8_wlan " /proc/modules)"
-	echo "cpus=$(cat /sys/devices/system/cpu/online)"
+	echo "cpus=$(cat /sys/devices/system/cpu/possible)"
+	echo "hps=$(cat /proc/hps/enabled 2>/dev/null)"
 	echo "avail=$(awk "/MemAvailable/ {print int(\$2/1024)}" /proc/meminfo)"
 	echo "zram=$(grep -c zram0 /proc/swaps)"
 	echo "temp=$(p_temp)"
@@ -44,7 +45,8 @@ eval "$(on '. /lib/penguin.sh; p_settings
 	echo "dinfo=\"$(docker info --format "{{.Driver}} cgroup-v{{.CgroupVersion}} {{.ServerVersion}}" 2>/dev/null)\""
 	echo "lan=\"$LAN_PORTS\" dlan=$DOCKER_LAN"
 	echo "uptime=$(cut -d. -f1 /proc/uptime)"
-	echo "crashes=$(ls /data/techo5-linux/crash 2>/dev/null | grep -c "^[0-9]")"
+	# Only dmesg-ramoops records are panics; console-ramoops is the console of every reboot, clean ones too.
+	echo "crashes=$(ls /data/techo5-linux/crash 2>/dev/null | grep -c "^[0-9]*-dmesg-ramoops")"
 	echo "rofs=$(grep -c " / .*ro[ ,]" /proc/mounts)"')"
 
 note "release: $rel"
@@ -52,7 +54,9 @@ note "kernel: $kern, docker: ${docker:-?}, slot ${slot:-none} ($slotstate)"
 [ -n "$slot" ] && pass "booted from slot $slot" || fail "running the rescue environment, not a slot"
 case "$slotstate" in good) pass "slot committed (good)";; trial*) warn "slot still on trial ($slotstate): commits after 5 healthy minutes";; *) fail "slot state '$slotstate'";; esac
 [ "$wlan" = 1 ] && pass "Wi-Fi driver loaded (mt76x8_wlan)" || fail "mt76x8_wlan not loaded"
-[ "$cpus" = 0-3 ] && pass "all four cores online" || warn "cores online: $cpus"
+# MediaTek's hotplug (/proc/hps) takes idle cores offline and brings them back under load, so the
+# number online at any moment says nothing; all four must exist and hps must be on.
+[ "$cpus" = 0-3 ] && [ "${hps:-1}" = 1 ] && pass "four cores, MediaTek hotplug on" || warn "cores: $cpus, hotplug: ${hps:-?}"
 [ "${avail:-0}" -ge 150 ] && pass "memory available: ${avail} MB" || fail "memory available: ${avail} MB (< 150)"
 [ "$zram" = 1 ] && pass "zram swap active" || warn "no zram swap"
 [ "$wd" = 1 ] && pass "watchdog fed" || warn "watchdog not running"
@@ -77,7 +81,7 @@ for p in 80 443 2375 8080; do
 	case " $lan " in *" $p "*) continue;; esac
 	if timeout 4 bash -c "exec 3<>/dev/tcp/$HOST/$p" 2>/dev/null; then fail "tcp $p reachable from the LAN (not in LAN_PORTS)"; else pass "tcp $p closed to the LAN"; fi
 done
-[ "${crashes:-0}" = 0 ] && pass "no kernel crash records" || warn "$crashes kernel crash record(s) in /data/techo5-linux/crash"
+[ "${crashes:-0}" = 0 ] && pass "no kernel panic records" || warn "$crashes kernel panic record(s) in /data/techo5-linux/crash (*-dmesg-ramoops)"
 note "up $((uptime / 3600)) h $((uptime % 3600 / 60)) min"
 
 cat <<EOF
