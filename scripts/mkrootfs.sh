@@ -123,10 +123,14 @@ chmod 1777 "$R/tmp"
 echo "echo-penguin rootfs $VERSION built $(date -u '+%Y-%m-%dT%H:%MZ'), techo5 $(cat "$IN/techo5-commit" 2>/dev/null)" > "$R/etc/techo5-release"
 
 # What slotctl insists on (sbin/init, usr/local/bin/techo5, etc/techo5/boot.sh, etc/inittab).
-for f in sbin/init usr/local/bin/techo5 etc/techo5/boot.sh etc/inittab usr/sbin/xtables-legacy-multi usr/bin/dockerd usr/bin/python3 lib/modules; do
+for f in sbin/init usr/local/bin/techo5 usr/local/bin/penguin-ui usr/local/sbin/penguin-sound etc/techo5/boot.sh etc/inittab usr/sbin/xtables-legacy-multi usr/bin/dockerd usr/bin/python3 usr/bin/aplay usr/bin/amixer lib/modules; do
 	[ -e "$R/$f" ] || [ -L "$R/$f" ] || { echo "mkrootfs: $f missing from the root" >&2; exit 1; }
 done
 
+# Python's parts a read-only appliance never uses: pip's bootstrap wheels, the pydoc topic index,
+# turtle demos, the static library for building extensions.
+rm -rf "$R"/usr/lib/python3*/ensurepip "$R"/usr/lib/python3*/pydoc_data "$R"/usr/lib/python3*/turtledemo \
+	"$R"/usr/lib/python3*/config-3*
 say "packing"
 rm -f "$OUT"
 # Guard: nothing owned by a build-machine user (uid/gid >= 1000; 65534 is Alpine's nobody) and nothing

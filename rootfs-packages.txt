@@ -8,13 +8,11 @@ dropbear
 dropbear-scp
 openssh-sftp-server   # so plain `scp` (SFTP mode, OpenSSH 9+) works without -O
 iw
-wireless-tools
 e2fsprogs
 tzdata
 ca-certificates
 curl
-htop
-util-linux-misc       # ionice, taskset for the Fase 2 budget rules
+util-linux-misc       # script(1): interactive sessions mirrored on the screen (profile.d/techo5.sh)
 
 # The kernel has iptables, not nftables: the legacy tools (overlay points iptables* at them).
 iptables
@@ -29,4 +27,5 @@ runc
 tini-static
 
 # rebootto (reboot into fastboot for a kernel change) is a short Python script.
-python3
+python3               # penguin-ui (the touch interface), penguin-sound, rebootto
+alsa-utils            # aplay, amixer: the speaker (penguin-sound)
