@@ -1,0 +1,21 @@
+From: echo-penguin
+Subject: [PATCH] fonts: prefer SUN12x22 as the console font
+
+CONFIG_FONT_8x16 is selected by the MediaTek video Kconfig, and 8x16 outranks SUN12x22 off SPARC,
+so fbcon would pick 8x16 (120x30 characters, hard to read on the 5.5" panel). fbcon=font: would
+lengthen the bootloader command line, which hangs warm reboots; give SUN12x22 the preference it
+has on SPARC instead.
+---
+diff --git a/lib/fonts/font_sun12x22.c b/lib/fonts/font_sun12x22.c
+index 057b0bf368a..0fbe1ecc663 100644
+--- a/lib/fonts/font_sun12x22.c
++++ b/lib/fonts/font_sun12x22.c
+@@ -6159,6 +6159,7 @@ const struct font_desc font_sun_12x22 = {
+ #ifdef __sparc__
+ 	.pref	= 5,
+ #else
+-	.pref	= -1,
++	/* echo-penguin: the console font on cronos (80x21 on 960x480), chosen without fbcon=font: */
++	.pref	= 5,
+ #endif
+ };

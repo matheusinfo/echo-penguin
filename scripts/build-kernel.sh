@@ -47,12 +47,16 @@ fragments=("$PENGUIN/kernel/safe.config")
 make -s -C "$KSRC" O="$KOUT" cronos_defconfig
 for f in "${fragments[@]}"; do
 	for o in $(fragment_options "$f"); do "$KSRC/scripts/config" --file "$KOUT/.config" --keep-case -e "$o"; done
+	for o in $(fragment_disabled "$f"); do "$KSRC/scripts/config" --file "$KOUT/.config" --keep-case -d "$o"; done
 done
 [ ${#PATCHES[@]} -gt 0 ] && "$KSRC/scripts/config" --file "$KOUT/.config" -d LOCALVERSION_AUTO --set-str LOCALVERSION "-g$KERNEL_COMMIT"
 make -s -C "$KSRC" O="$KOUT" olddefconfig
 for f in "${fragments[@]}"; do
 	for o in $(fragment_options "$f"); do
 		grep -q "^CONFIG_$o=y" "$KOUT/.config" || die "CONFIG_$o did not survive olddefconfig (a dependency is missing)"
+	done
+	for o in $(fragment_disabled "$f"); do
+		grep -q "^CONFIG_$o=" "$KOUT/.config" && die "CONFIG_$o is still on after olddefconfig (something selects it)"
 	done
 done
 make -s -C "$KSRC" O="$KOUT" -j"$(nproc)" Image.gz-dtb modules

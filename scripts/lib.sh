@@ -39,7 +39,12 @@ at_commit() {
 
 # fragment_options <file>: the option names (no CONFIG_, no =y) a kernel fragment turns on.
 fragment_options() {
-	sed 's/#.*//;/^[[:space:]]*$/d;s/^CONFIG_//;s/=y[[:space:]]*$//' "$1"
+	sed -n 's/#.*//;s/^CONFIG_\([A-Za-z0-9_]*\)=y[[:space:]]*$/\1/p' "$1"
+}
+
+# fragment_disabled <file>: the option names a kernel fragment turns off (CONFIG_X=n lines).
+fragment_disabled() {
+	sed -n 's/#.*//;s/^CONFIG_\([A-Za-z0-9_]*\)=n[[:space:]]*$/\1/p' "$1"
 }
 
 # techo5_lib <out>: TECHO5's tools/linux/techo5-lib.sh with echo-penguin's fixes, written to <out>.

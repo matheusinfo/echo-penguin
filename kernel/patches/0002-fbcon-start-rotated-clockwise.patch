@@ -1,0 +1,26 @@
+From: echo-penguin
+Subject: [PATCH] fbcon: start rotated 90 degrees clockwise on cronos
+
+The cronos panel is 480x960 portrait, mounted sideways. fbcon=rotate:1 would turn the text, but
+the bootloader passes a command line of ~1012 bytes against a 1024-byte limit, and the extra
+bytes hang the unit at the boot logo on a warm reboot (measured 2026-10-31). Make clockwise
+the default instead; fbcon=rotate: still overrides it.
+---
+diff --git a/drivers/video/console/fbcon.c b/drivers/video/console/fbcon.c
+index 510bc3f51dc..2e45e32657a 100644
+--- a/drivers/video/console/fbcon.c
++++ b/drivers/video/console/fbcon.c
+@@ -129,7 +129,12 @@ static char fontname[40];
+ static int info_idx = -1;
+ 
+ /* console rotation */
+-static int initial_rotation;
++/*
++ * echo-penguin: the cronos panel is portrait, mounted sideways; start rotated 90 degrees clockwise
++ * so text reads in landscape without fbcon=rotate:1 (the bootloader's command line is near its
++ * 1024-byte limit, and a longer one hangs the unit on a warm reboot).
++ */
++static int initial_rotation = FB_ROTATE_CW;
+ static int fbcon_has_sysfs;
+ 
+ static const struct consw fb_con;
