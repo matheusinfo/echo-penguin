@@ -1,0 +1,32 @@
+# Alpine packages apk installs into the echo-penguin root filesystem (TECHO5's mkrootfs.sh), from
+# the v3.24 main + community repositories the minirootfs points at. One per line; # starts a comment.
+# Replaces TECHO5's packages-rootfs.txt: no voice, Bluetooth, AirPlay or Spotify (headless decision,
+# plan-echo-show-5.md, section 2.2). wpa_supplicant 2.9 still comes from TECHO5's local v3.12 set.
+
+# Base, as in TECHO5: SSH, Wi-Fi tools, filesystems, time zones.
+dropbear
+dropbear-scp
+openssh-sftp-server   # so plain `scp` (SFTP mode, OpenSSH 9+) works without -O
+iw
+wireless-tools
+e2fsprogs
+tzdata
+ca-certificates
+curl
+htop
+util-linux-misc       # ionice, taskset for the Fase 2 budget rules
+
+# The kernel has iptables, not nftables: the legacy tools (overlay points iptables* at them).
+iptables
+iptables-legacy
+
+# Docker (started only on the docker kernel, which has the namespaces and cgroups it needs).
+docker-engine
+docker-cli
+docker-cli-compose
+containerd
+runc
+tini-static
+
+# rebootto (reboot into fastboot for a kernel change) is a short Python script.
+python3

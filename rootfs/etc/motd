@@ -1,0 +1,5 @@
+echo-penguin — Echo Show 5 (cronos) as a headless Linux server (Alpine, SSH, Docker).
+Root is read-only; state on /data, slots on /store (slotctl status).
+  penguin status      what runs, mode, temperature, memory
+  penguin logs [supervisor|docker|boot|firewall]
+  penguin settings    effective settings (/data/penguin/settings.conf overrides)
