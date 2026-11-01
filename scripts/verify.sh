@@ -42,6 +42,8 @@ eval "$(on '. /lib/penguin.sh; p_settings
 	echo "temp=$(p_temp)"
 	echo "wd=$(pidof watchdog >/dev/null && echo 1 || echo 0)"
 	echo "dropbear=$(pidof dropbear >/dev/null && echo 1 || echo 0)"
+	echo "sshopts=\"$(ps -o args | grep "^dropbear -R" | head -1)\""
+	echo "sshallow=\"$SSH_ALLOW\""
 	echo "dinfo=\"$(docker info --format "{{.Driver}} cgroup-v{{.CgroupVersion}} {{.ServerVersion}}" 2>/dev/null)\""
 	echo "lan=\"$LAN_PORTS\" dlan=$DOCKER_LAN"
 	echo "uptime=$(cut -d. -f1 /proc/uptime)"
@@ -61,6 +63,14 @@ case "$slotstate" in good) pass "slot committed (good)";; trial*) warn "slot sti
 # MediaTek's hotplug (/proc/hps) takes idle cores offline and brings them back under load, so the
 # number online at any moment says nothing; all four must exist and hps must be on.
 [ "$cpus" = 0-3 ] && [ "${hps:-1}" = 1 ] && pass "four cores, MediaTek hotplug on" || warn "cores: $cpus, hotplug: ${hps:-?}"
+missing=
+for o in "-s" "-g" "-T 3" "-k"; do
+	case " $sshopts " in *" $o "*) ;; *) missing="$missing $o";; esac
+done
+[ -z "$missing" ] && pass "dropbear: keys only, 3 tries, no remote forwarding" ||
+	fail "dropbear options: '$sshopts' (missing$missing)"
+[ -n "$sshallow" ] && pass "SSH limited to: $sshallow" ||
+	warn "SSH open to any device on the Wi-Fi (key still required): penguin ssh allow here"
 [ "${fbcon:-0}" -ge 1 ] && pass "screen console (fbcon)" || fail "no framebuffer console: the screen shows nothing"
 if [ "${SCREEN_UI_EXPECTED:-1}" = 1 ]; then
 	[ "${ui:-0}" = 1 ] && pass "touch interface running" || fail "penguin-ui is not running (${ui:-0} instances)"

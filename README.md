@@ -23,7 +23,7 @@ without anyone touching it. It is built on top of the
 - [What you get](#what-you-get)
 - [Goals and non-goals](#goals-and-non-goals)
 - [Quick start](#quick-start)
-- [Using the Echo](#using-the-echo)
+- [Using the Echo](#using-the-echo) ([Securing SSH](#securing-ssh))
 - [How it works](#how-it-works)
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
@@ -38,7 +38,7 @@ without anyone touching it. It is built on top of the
 |---|---|
 | **Hardware** | MediaTek MT8163, 4x Cortex-A53 up to 1.3 GHz, ~1 GB RAM (+480 MB zram swap), 7.3 GiB eMMC, MT7668 Wi-Fi (2.4/5 GHz) |
 | **System** | Alpine Linux 3.24 (armv7 userland), busybox init, read-only root, state on `/data` |
-| **Access** | Wi-Fi + SSH (Dropbear, **keys only**); a root console over USB as a fallback |
+| **Access** | Wi-Fi + SSH (Dropbear, **keys only**, optionally limited to the computers you list, can be turned off); a root console over USB as a fallback |
 | **Containers** | Docker (overlay2, data on `/data/docker`) on the `docker` kernel |
 | **Reliability** | hardware watchdog, temperature guard, weekly restart, rotated logs, A/B system slots with automatic rollback |
 | **Security** | firewall closes everything on Wi-Fi except SSH and the ports you choose |
@@ -159,12 +159,17 @@ ssh -i ~/.ssh/techo5 root@<echo-ip>
 | `penguin firewall` | re-apply the firewall after changing `LAN_PORTS` or `DOCKER_LAN` |
 | `penguin restart` | restart the supervisor (containers keep running) |
 | `slotctl status` | which system slot is active, and its state |
+| `penguin ssh` | SSH on/off, the allowed computers, the authorized keys and their fingerprints |
+| `penguin ssh allow here` / `deny ADDR` / `allow any` | add this computer to the SSH allow list, remove one, clear the list |
+| `penguin ssh on` / `off` | start or stop SSH |
 
 **Settings.** Defaults live in [/etc/penguin/defaults.conf](rootfs/etc/penguin/defaults.conf);
 your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `SSH` | `on` | `off` stops SSH and closes port 22 (`penguin ssh on\|off`, or the screen) |
+| `SSH_ALLOW` | *(empty)* | the only computers allowed to connect: MAC and/or IP addresses (`penguin ssh allow here`) |
 | `LAN_PORTS` | *(empty)* | extra TCP ports open on Wi-Fi, e.g. `"80 443"` |
 | `DOCKER_LAN` | `0` | `1` lets containers' published ports be reached from Wi-Fi |
 | `DOCKER` | `auto` | start Docker when the kernel supports it, or `off` |
@@ -185,6 +190,39 @@ framebuffer console, Python's standard library only.
 **Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav`,
 `penguin-sound volume [0-100]`. It holds the workaround the MediaTek playback driver needs (without
 it, the first sound panics the kernel), so use it rather than `aplay` directly.
+
+### Securing SSH
+
+Out of the box, SSH accepts **keys only**: no password works, not even root's. Dropbear runs with
+`-s -g -T 3 -k` (no passwords, three attempts per connection, no remote port forwarding; `ssh -L`
+tunnels still work), and the firewall limits new SSH connections per source (6 at once, then 6 a
+minute). What is left open by default is *who may try*: any device on your Wi-Fi network reaches
+port 22. To allow only the computers you choose:
+
+```bash
+# On each computer that should connect, once, over SSH:
+ssh -i ~/.ssh/techo5 root@<echo-ip> penguin ssh allow here     # adds this computer's MAC
+penguin ssh                                                     # the list, the keys, their fingerprints
+penguin ssh deny aa:bb:cc:dd:ee:ff                              # remove one
+penguin ssh allow any                                           # back to any device on the Wi-Fi
+```
+
+- **Each computer has its own key.** Add its public key as one line of
+  `/data/misc/techo5/ssh/authorized_keys`; delete the line to revoke it. `penguin ssh` lists them.
+- **MAC addresses are preferred** in `SSH_ALLOW`: an IP from DHCP can go to another device later.
+  Use an IP address or a network (`192.168.1.0/24`, IPv6 too) only where there is no MAC to see,
+  such as a VPN. A MAC can be spoofed by someone already on your Wi-Fi, so the list narrows who can
+  try. The key is still what lets a computer in.
+- `penguin ssh allow` and `deny` **refuse a list that would lock out** the session running them
+  (`--force` overrides that).
+- **Turning SSH off:** `penguin ssh off`, or **Network & SSH → SSH is ON** on the screen (tap twice).
+  Port 22 closes and dropbear stops. Turn it back on from the same screen, or from the USB console
+  (`ECHO_SERIAL=<serial> scripts/console.py 'penguin ssh on'`).
+- **Locked out?** Network & SSH → **Allow any device** on the screen clears the list, and so does
+  `penguin ssh allow any` on the USB console.
+- Not covered by this: the **USB console** is a root shell for whoever has the unit and a cable in
+  hand (physical access wins anyway). The **rescue environment**, which only runs after a failed
+  boot, comes from TECHO5's boot image: it starts SSH with the same keys and without the firewall.
 
 **Reaching a container.** Published ports are closed on Wi-Fi by default; use an SSH tunnel:
 
@@ -352,7 +390,7 @@ flowchart TB
 - **Screen** ([penguin-ui](rootfs/usr/local/bin/penguin-ui)): the touch interface on tty1. The
   log console (kernel errors, boot log, mirrored sessions) is tty2, shown by its Logs screen.
 - **Watchdog**: if userspace hangs, the hardware watchdog restarts the unit.
-- **SSH**: password logins are disabled; only keys in `/data/misc/techo5/ssh/authorized_keys`
+- **SSH**: see [Securing SSH](#securing-ssh). Password logins are disabled; only keys in `/data/misc/techo5/ssh/authorized_keys`
   work.
 
 ## Maintenance
