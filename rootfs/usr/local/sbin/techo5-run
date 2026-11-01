@@ -1,0 +1,13 @@
+#!/bin/sh
+# The supervisor under busybox init (inittab respawn). /usr/local/bin/techo5 keeps TECHO5's name
+# because slotctl, the slot trial and the installer look for a process called techo5; what it runs
+# is echo-penguin's service supervisor. init starts this again whenever it exits.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LOG=/data/penguin/logs/supervisor.log
+mkdir -p /data/penguin/logs
+# Maintenance: while /run/techo5/hold exists nothing is started. `rm` it to resume.
+while [ -e /run/techo5/hold ]; do sleep 5; done
+[ -f $LOG ] && [ "$(stat -c %s $LOG 2>/dev/null || echo 0)" -gt 2000000 ] && mv -f $LOG $LOG.1
+echo "techo5-run: starting $(/usr/local/bin/techo5 --version 2>/dev/null) at $(date)" >> $LOG
+exec /usr/local/bin/techo5 run >> $LOG 2>&1

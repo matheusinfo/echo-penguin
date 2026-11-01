@@ -1,0 +1,102 @@
+#!/bin/sh
+# /usr/local/bin/techo5 — echo-penguin's service supervisor.
+#
+# Named techo5 on purpose: TECHO5's slotctl refuses a rootfs without this file, and its slot trial
+# (boot.sh) and installer judge a boot by whether a process called techo5 has been running for five
+# minutes. A script's process name is its file name, so this one passes for the daemon. inittab
+# keeps it alive through techo5-run.
+#
+#   techo5 run        supervise (what techo5-run does)
+#   techo5 --version
+#
+# What it looks after (settings: /etc/penguin/defaults.conf, overridden by /data/penguin/settings.conf):
+#   dockerd          on the docker kernel (DOCKER=auto), started and restarted when it dies
+#   temperature      above TEMP_CRIT running containers are paused until the CPU is back at TEMP_WARN
+#   weekly restart   WEEKLY_REBOOT_DAY / WEEKLY_REBOOT_HOUR (plan, Stage 8.3)
+VERSION=0.2.0
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+case "${1:-}" in
+--version) echo "echo-penguin supervisor $VERSION"; exit 0;;
+run) ;;
+*) echo "usage: techo5 run | --version" >&2; exit 2;;
+esac
+
+. /lib/penguin.sh
+p_settings
+say() { echo "$(date '+%F %T') $*"; }
+
+# Started by the rescue initramfs (no slot booted): stay up and do nothing, so rescue counts the
+# "daemon" as running and keeps the unit reachable, without starting services on a half-broken unit.
+if [ ! -e /run/techo5/slot ]; then
+	say "rescue environment: idle"
+	while :; do sleep 3600; done
+fi
+
+mkdir -p $PENGUIN_LOGS /run/penguin
+HOT=; PAUSED=
+
+trap 'say "stopping"; exit 0' TERM INT
+
+docker_wanted() {
+	[ "${DOCKER:-auto}" != off ] && p_docker_kernel && command -v dockerd >/dev/null
+}
+docker_up() {
+	[ -S /run/docker.sock ] && docker info >/dev/null 2>&1
+}
+start_dockerd() {
+	docker_up && return 0
+	p_rotate $PENGUIN_LOGS/docker.log
+	mkdir -p /data/docker
+	dockerd --config-file /etc/docker/daemon.json >> $PENGUIN_LOGS/docker.log 2>&1 &
+	n=0; while [ $n -lt 60 ] && ! docker_up; do sleep 1; n=$((n+1)); done
+	docker_up || { say "dockerd did not come up in 60 s (see $PENGUIN_LOGS/docker.log)"; return 1; }
+	say "dockerd up after ${n}s: $(docker version --format '{{.Server.Version}}' 2>/dev/null), storage $(docker info --format '{{.Driver}}' 2>/dev/null), cgroups $(docker info --format '{{.CgroupVersion}}' 2>/dev/null)"
+	# dockerd has made DOCKER-USER now: apply the Wi-Fi rule to published ports.
+	/usr/local/sbin/techo5-firewall >> /data/techo5-linux/firewall.log 2>&1
+}
+
+if docker_wanted; then
+	echo docker > /run/penguin/docker
+	start_dockerd
+else
+	echo off > /run/penguin/docker
+	say "docker: off ($(p_docker_kernel && echo "DOCKER=$DOCKER" || echo 'safe kernel, no namespaces'))"
+fi
+
+last_reboot_check=
+while :; do
+	sleep 15 &
+	wait $!
+	if docker_wanted && ! docker_up; then
+		say "dockerd is not running; starting it"
+		start_dockerd
+	fi
+	# Temperature: containers paused when too hot (the unit has no fan), resumed once it cools.
+	t=$(p_temp)
+	echo "${t:-?}" > /run/penguin/temp
+	if [ -n "$t" ] && [ "$t" -ge "${TEMP_CRIT:-85}" ] && [ -z "$HOT" ]; then
+		HOT=1
+		PAUSED=$(docker ps -q --filter status=running 2>/dev/null | tr '\n' ' ')
+		say "temperature ${t}C >= ${TEMP_CRIT}C: pausing containers until ${TEMP_WARN}C ($PAUSED)"
+		[ -n "$PAUSED" ] && docker pause $PAUSED >/dev/null 2>&1
+	elif [ -n "$HOT" ] && [ -n "$t" ] && [ "$t" -le "${TEMP_WARN:-75}" ]; then
+		say "temperature ${t}C: resuming"
+		[ -n "$PAUSED" ] && docker unpause $PAUSED >/dev/null 2>&1
+		HOT=; PAUSED=
+	elif [ -n "$t" ] && [ "$t" -ge "${TEMP_WARN:-75}" ] && [ ! -e /run/penguin/warm ]; then
+		say "temperature ${t}C >= ${TEMP_WARN}C"; : > /run/penguin/warm
+	elif [ -n "$t" ] && [ "$t" -lt "${TEMP_WARN:-75}" ]; then
+		rm -f /run/penguin/warm
+	fi
+	# Weekly restart, once, in the configured hour, on a unit up for more than a day.
+	if [ -n "${WEEKLY_REBOOT_DAY:-}" ] && [ "$(date +%w)" = "$WEEKLY_REBOOT_DAY" ] &&
+		[ "$(date +%H | sed 's/^0//')" = "${WEEKLY_REBOOT_HOUR:-4}" ] && [ "$(date +%Y)" -ge 2020 ] &&
+		[ "$(cut -d. -f1 /proc/uptime)" -gt 86400 ] && [ -z "$last_reboot_check" ]; then
+		last_reboot_check=1
+		say "weekly restart"
+		sync
+		reboot
+	fi
+done

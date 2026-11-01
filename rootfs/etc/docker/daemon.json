@@ -1,0 +1,11 @@
+{
+  "data-root": "/data/docker",
+  "exec-root": "/run/docker",
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "5m", "max-file": "2" },
+  "iptables": true,
+  "ip6tables": false,
+  "features": { "containerd-snapshotter": false },
+  "live-restore": false
+}

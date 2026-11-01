@@ -1,0 +1,61 @@
+#!/bin/sh
+# penguin — echo-penguin on the unit, from an SSH session or the USB console.
+#
+#   penguin status              kernel, services, containers, temperature, memory, disk, slots
+#   penguin logs [what] [-f]    supervisor (default) | docker | boot | firewall
+#   penguin settings            effective settings (defaults + /data/penguin/settings.conf)
+#   penguin set KEY VALUE       write one setting to /data/penguin/settings.conf
+#   penguin restart             restart the supervisor (dockerd keeps running)
+#   penguin firewall            apply techo5-firewall again (after changing LAN_PORTS or DOCKER_LAN)
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+. /lib/penguin.sh
+p_settings
+
+status() {
+	echo "release:   $(cat /etc/techo5-release 2>/dev/null)"
+	echo "kernel:    $(uname -r) ($(p_docker_kernel && echo 'docker kernel' || echo 'safe kernel, no containers'))"
+	echo "slot:      $(cat /run/techo5/slot 2>/dev/null || echo 'none (rescue)')"
+	echo "docker:    $(cat /run/penguin/docker 2>/dev/null || echo '?') (DOCKER=$DOCKER)"
+	echo "address:   $(ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.\/]*\).*/\1/p' | head -1)"
+	for p in techo5 dockerd containerd dropbear wpa_supplicant ntpd watchdog; do
+		printf '  %-15s %s\n' "$p" "$(pidof $p >/dev/null && echo running || echo -)"
+	done
+	if [ "$(cat /run/penguin/docker 2>/dev/null)" = docker ]; then
+		docker ps -a --format '  container {{.Names}}: {{.Status}}' 2>/dev/null
+	fi
+	echo "temp:      $(p_temp)C (warn $TEMP_WARN, crit $TEMP_CRIT)"
+	echo "cpus:      $(cat /sys/devices/system/cpu/online)  load $(cut -d' ' -f1-3 /proc/loadavg)"
+	free -m | sed 's/^/  /'
+	df -h /data /store 2>/dev/null | sed 's/^/  /'
+	STORE=/store slotctl status 2>/dev/null | sed 's/^/  /'
+}
+
+case "${1:-status}" in
+status) status;;
+logs)
+	what=${2:-supervisor}; follow=
+	[ "${3:-}" = -f ] || [ "${2:-}" = -f ] && follow=1
+	[ "$what" = -f ] && what=supervisor
+	case "$what" in
+	boot) f=/run/boot.log;;
+	firewall) f=/data/techo5-linux/firewall.log;;
+	supervisor|docker) f=$PENGUIN_LOGS/$what.log;;
+	*) echo "logs: supervisor | docker | boot | firewall" >&2; exit 2;;
+	esac
+	if [ -n "$follow" ]; then exec tail -n 50 -f "$f"; else tail -n 100 "$f"; fi
+	;;
+settings) (set -a; . /etc/penguin/defaults.conf; [ -r $PENGUIN_DATA/settings.conf ] && . $PENGUIN_DATA/settings.conf
+	sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' /etc/penguin/defaults.conf | while read -r k; do eval "echo $k=\"\$$k\""; done);;
+set)
+	[ -n "${2:-}" ] && [ $# -ge 3 ] || { echo "usage: penguin set KEY VALUE" >&2; exit 2; }
+	grep -q "^$2=" /etc/penguin/defaults.conf || { echo "unknown setting $2 (see penguin settings)" >&2; exit 2; }
+	mkdir -p $PENGUIN_DATA
+	touch $PENGUIN_DATA/settings.conf
+	sed -i "/^$2=/d" $PENGUIN_DATA/settings.conf
+	printf '%s="%s"\n' "$2" "$3" >> $PENGUIN_DATA/settings.conf
+	echo "$2=$3 (takes effect after: penguin restart; firewall settings: penguin firewall)"
+	;;
+restart) killall techo5 2>/dev/null; echo "supervisor restarting (init starts it again)";;
+firewall) /usr/local/sbin/techo5-firewall;;
+*) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+esac
