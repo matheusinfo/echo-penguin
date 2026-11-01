@@ -28,7 +28,7 @@ without anyone touching it. It is built on top of the
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
-- [Status and roadmap](#status-and-roadmap)
+- [Status and next steps](#status-and-next-steps)
 - [Contributing](#contributing)
 - [References](#references)
 - [License](#license)
@@ -499,33 +499,43 @@ work/         kernel tree, toolchain, Wi-Fi driver, extracted LineageOS, staging
 work/out/     the finished boot images, kernels and rootfs tarballs
 ```
 
-## Status and roadmap
+## Status and next steps
 
 **Current version: v0.2.5** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
-the docker kernel. `verify.sh` passes, and warm reboots, power cuts, slot switches with rollback
-protection, Docker, the touch screen, the speaker and the SSH controls have all been tested on the
-unit.
+the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
+power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
+SSH controls.
 
-Still to be confirmed over time: 24 h and 72 h unattended, a Wi-Fi outage (router off for a
-minute), and a deliberate rollback.
+### Next steps
 
-Not there yet, roughly in order of usefulness:
+**Tests still to run on the unit:**
 
-1. **Changing the Wi-Fi network from the unit.** The network comes from LineageOS, or from
+- [ ] 24 h unattended: `penguin status`, and `penguin logs supervisor` with no restarts
+- [ ] 72 h unattended: uptime over 72 h, no new `*-dmesg-ramoops` in `/data/techo5-linux/crash`
+- [ ] Wi-Fi outage: router off for a minute; SSH comes back by itself (`penguin logs boot`)
+- [ ] Deliberate rollback: a broken slot falls back to the previous one (`slotctl status`)
+
+**Features, roughly in order of usefulness:**
+
+1. **Changing the Wi-Fi network from the unit.** Today the network comes from LineageOS, or from
    `--wifi` at install time. Moving the Echo to another router means editing
-   `/data/techo5-linux/wpa_supplicant.conf` from the USB console. A `penguin wifi` command (and a
-   screen for it) would close this.
-2. **One-command updates from the PC**: build, copy, `slotctl install`, reboot, wait for the commit,
-   verify. Today it is the three commands under [Updating the system](#updating-the-system).
+   `/data/techo5-linux/wpa_supplicant.conf` from the USB console. Next: a `penguin wifi`
+   command (scan, add, remove, switch) and a Wi-Fi screen.
+2. **One-command updates from the PC.** Today it is the three commands under
+   [Updating the system](#updating-the-system). Next: a `scripts/update.sh` that builds, copies,
+   runs `slotctl install`, reboots, waits for the slot to commit and runs `verify.sh`.
 3. **Night mode / automatic brightness.** The light sensor (`m_alsps_input`) is unused, and the
-   panel stays at `BACKLIGHT` around the clock.
-4. **Backup and restore of `/data`**: keys, settings, the alarm, containers' volumes.
-5. **The mute button** (`gpio-privacy-button`) does nothing yet; it could turn the screen off/on or
-   stop the alarm.
-6. **The rescue environment's SSH** (TECHO5's initramfs, only after a failed boot) runs without the
-   firewall or `SSH_ALLOW`. A build-time fix like the existing NTP one would cover it.
-7. **A name on the network** (`echo-penguin.local`), so the IP does not have to be looked up (it is
-   on the screen meanwhile).
+   panel stays at `BACKLIGHT` around the clock. Next: brightness that follows the room's light,
+   and/or a dim or dark schedule at night that still wakes for the alarm.
+4. **Backup and restore of `/data`.** Next: a `scripts/backup.sh` / `restore.sh` for the keys,
+   settings, the alarm and containers' volumes.
+5. **The mute button.** `gpio-privacy-button` does nothing yet. Next: screen off/on, or stop the
+   alarm.
+6. **The rescue environment's SSH.** It comes from TECHO5's initramfs and only runs after a failed
+   boot, but it has no firewall and ignores `SSH_ALLOW`. Next: a build-time fix in `scripts/lib.sh`,
+   like the existing NTP one.
+7. **A name on the network.** Next: answer to `echo-penguin.local` (mDNS), so the IP does not have
+   to be looked up. Meanwhile it is on the screen, under Network & SSH.
 
 ## Contributing
 
