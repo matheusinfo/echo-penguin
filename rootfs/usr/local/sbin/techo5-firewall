@@ -4,6 +4,10 @@
 # network comes up, and again by the supervisor after dockerd has made its chains; safe to run any
 # number of times. `penguin firewall` runs it after a settings change.
 #
+# SSH: closed altogether with SSH=off. With SSH_ALLOW set, port 22 opens only to those devices: MAC
+# addresses (both families) and IPv4/IPv6 addresses or networks. New SSH connections are limited per
+# source (a burst of 6, then 6 a minute) so nothing can hammer the key exchange.
+#
 # Each address family stands alone: a rule that fails leaves that family's chain empty (open) rather
 # than a unit nobody can reach, and says so, without touching the other family.
 #
@@ -18,9 +22,47 @@ export PATH
 command -v iptables-legacy > /dev/null || { echo "techo5-firewall: no iptables-legacy in this image" >&2; exit 0; }
 CHAIN=PENGUIN-IN
 PORTS=
+SSH_SUMMARY=
 for p in ${LAN_PORTS:-}; do
 	case "$p" in *[!0-9]*|"") echo "techo5-firewall: LAN_PORTS: '$p' is not a port; ignored" >&2;; *) PORTS="$PORTS $p";; esac
 done
+
+# is_mac / is_v4 / is_v6 <word>: what an SSH_ALLOW entry is.
+is_mac() { echo "$1" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; }
+is_v4() { echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; }
+is_v6() { ! is_mac "$1" && echo "$1" | grep -qiE '^[0-9a-f:]*:[0-9a-f:.]*(/[0-9]{1,3})?$'; }
+
+# ssh_rules <tool>: port 22 for one family, as SSH and SSH_ALLOW say.
+ssh_rules() {
+	T=$1
+	[ "${SSH:-on}" = off ] && return 0
+	fam=4; [ "$T" = ip6tables-legacy ] && fam=6
+	$T -w -A $CHAIN -p tcp --dport 22 -m state --state NEW -m hashlimit --hashlimit-name ssh$fam \
+		--hashlimit-mode srcip --hashlimit-above 6/minute --hashlimit-burst 6 -j DROP || return 1
+	if [ -z "${SSH_ALLOW:-}" ]; then
+		$T -w -A $CHAIN -p tcp --dport 22 -j ACCEPT
+		return
+	fi
+	for a in $SSH_ALLOW; do
+		if is_mac "$a"; then
+			$T -w -A $CHAIN -p tcp --dport 22 -m mac --mac-source "$a" -j ACCEPT || return 1
+		elif is_v4 "$a"; then
+			[ $fam = 4 ] && { $T -w -A $CHAIN -p tcp --dport 22 -s "$a" -j ACCEPT || return 1; }
+		elif is_v6 "$a"; then
+			[ $fam = 6 ] && { $T -w -A $CHAIN -p tcp --dport 22 -s "$a" -j ACCEPT || return 1; }
+		else
+			echo "techo5-firewall: SSH_ALLOW: '$a' is not a MAC or IP address; ignored" >&2
+		fi
+	done
+	return 0
+}
+if [ "${SSH:-on}" = off ]; then
+	SSH_SUMMARY="SSH off"
+elif [ -n "${SSH_ALLOW:-}" ]; then
+	SSH_SUMMARY="tcp 22 from $SSH_ALLOW only"
+else
+	SSH_SUMMARY="tcp 22"
+fi
 
 # rules <tool>: PENGUIN-IN for one family, jumped to from INPUT for wlan0.
 rules() {
@@ -29,7 +71,8 @@ rules() {
 	$T -w -F $CHAIN || return 1
 	$T -w -C INPUT -i wlan0 -j $CHAIN 2> /dev/null || $T -w -I INPUT -i wlan0 -j $CHAIN || return 1
 	$T -w -A $CHAIN -m state --state ESTABLISHED,RELATED -j ACCEPT || return 1
-	for p in 22 $PORTS; do
+	ssh_rules $T || return 1
+	for p in $PORTS; do
 		$T -w -A $CHAIN -p tcp --dport "$p" -j ACCEPT || return 1
 	done
 	if [ "$T" = iptables-legacy ]; then
@@ -45,7 +88,7 @@ rules() {
 status=0
 for T in iptables-legacy ip6tables-legacy; do
 	if rules $T 2> /tmp/firewall.$T.err; then
-		echo "techo5-firewall: $T: Wi-Fi inbound closed except tcp 22$PORTS" >&2
+		echo "techo5-firewall: $T: Wi-Fi inbound closed except $SSH_SUMMARY${PORTS:+, tcp$PORTS}" >&2
 	else
 		$T -w -F $CHAIN 2> /dev/null
 		echo "techo5-firewall: $T: a rule failed ($(tail -1 /tmp/firewall.$T.err)); left open" >&2

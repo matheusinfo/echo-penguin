@@ -7,6 +7,11 @@
 #   penguin set KEY VALUE       write one setting to /data/penguin/settings.conf
 #   penguin restart             restart the supervisor (dockerd keeps running)
 #   penguin firewall            apply techo5-firewall again (after changing LAN_PORTS or DOCKER_LAN)
+#   penguin ssh [status]        SSH: on or off, who may connect, the authorized keys
+#   penguin ssh on | off        start or stop SSH (off: USB console and the screen still work)
+#   penguin ssh allow here | ADDR...   add computers (MAC / IP / network); then only those connect
+#   penguin ssh deny ADDR...    remove computers from that list
+#   penguin ssh allow any       clear the list: any device on the Wi-Fi may try (a key is still needed)
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 . /lib/penguin.sh
 p_settings
@@ -30,8 +35,146 @@ status() {
 	STORE=/store slotctl status 2>/dev/null | sed 's/^/  /'
 }
 
+# set_setting KEY VALUE: one setting into /data/penguin/settings.conf.
+set_setting() {
+	mkdir -p $PENGUIN_DATA
+	touch $PENGUIN_DATA/settings.conf
+	sed -i "/^$1=/d" $PENGUIN_DATA/settings.conf
+	printf '%s="%s"\n' "$1" "$2" >> $PENGUIN_DATA/settings.conf
+}
+
+firewall_apply() { /usr/local/sbin/techo5-firewall > /data/techo5-linux/firewall.log 2>&1; tail -2 /data/techo5-linux/firewall.log | sed -n '1p'; }
+
+# The computer this command runs for, when it runs over SSH: its address, and its MAC from the ARP
+# table (on the same Wi-Fi network only).
+client_ip() { echo "${SSH_CONNECTION%% *}"; }
+client_mac() { awk -v ip="$(client_ip)" '$1 == ip {print $4}' /proc/net/arp | head -1; }
+
+ssh_keys() {
+	python3 - /data/misc/techo5/ssh/authorized_keys <<'PY'
+import base64, hashlib, sys
+try:
+    lines = open(sys.argv[1]).read().splitlines()
+except OSError:
+    lines = []
+n = 0
+for line in lines:
+    parts = line.split()
+    for i, p in enumerate(parts):
+        if p.startswith(('ssh-', 'ecdsa-', 'sk-')) and i + 1 < len(parts):
+            fp = base64.b64encode(hashlib.sha256(base64.b64decode(parts[i + 1])).digest()).decode().rstrip('=')
+            n += 1
+            print('  %d. %s SHA256:%s  %s' % (n, p, fp, ' '.join(parts[i + 2:]) or '(no comment)'))
+            break
+print('  %d key(s) in %s' % (n, sys.argv[1]))
+PY
+}
+
+ssh_status() {
+	echo "SSH:       ${SSH:-on} (dropbear $(pidof dropbear >/dev/null && echo running || echo 'not running'), keys only)"
+	echo "allowed:   ${SSH_ALLOW:-any device on the Wi-Fi network (with an authorized key)}"
+	[ -n "${SSH_CONNECTION:-}" ] && echo "you:       $(client_ip) $(client_mac)"
+	echo "firewall:  $(grep -m1 'iptables-legacy:' /data/techo5-linux/firewall.log 2>/dev/null | sed 's/^techo5-firewall: //')"
+	echo "keys:"
+	ssh_keys
+}
+
+# ssh_allow_check LIST: whether this SSH session's computer is in LIST (by MAC, address or network).
+ssh_allow_check() {
+	[ -n "${SSH_CONNECTION:-}" ] || return 0
+	python3 - "$(client_ip)" "$(client_mac)" "$@" <<'PY'
+import ipaddress, sys
+ip, mac, entries = sys.argv[1], sys.argv[2].lower(), sys.argv[3:]
+for e in entries:
+    if e.lower() == mac and mac:
+        sys.exit(0)
+    try:
+        if ipaddress.ip_address(ip) in ipaddress.ip_network(e, strict=False):
+            sys.exit(0)
+    except ValueError:
+        pass
+sys.exit(1)
+PY
+}
+
+ssh_cmd() {
+	case "${1:-status}" in
+	status) ssh_status;;
+	on)
+		set_setting SSH on; SSH=on
+		firewall_apply
+		. /lib/techo5-lib.sh 2>/dev/null; log() { p_log ssh "$*"; }
+		p_ssh; sleep 1
+		pidof dropbear >/dev/null && echo "SSH is on" || { echo "SSH did not start (penguin logs boot)" >&2; exit 1; }
+		;;
+	off)
+		set_setting SSH off; SSH=off
+		firewall_apply
+		echo "SSH is off: port 22 closed. Turn it back on with 'penguin ssh on' on the USB console, or on the screen (Network & SSH)."
+		[ -n "${SSH_CONNECTION:-}" ] && echo "This session ends in 2 s."
+		# Detached, so this message reaches an SSH session before its dropbear goes.
+		setsid sh -c 'sleep 2; killall dropbear' >/dev/null 2>&1 &
+		;;
+	allow|deny)
+		verb=$1; shift
+		force=
+		[ "${1:-}" = --force ] && { force=1; shift; }
+		[ $# -ge 1 ] || { echo "usage: penguin ssh allow here | ADDR... | any; penguin ssh deny ADDR...   (MAC, IPv4/IPv6 address or network)" >&2; exit 2; }
+		if [ $verb = allow ] && [ "$1" = any ]; then
+			set_setting SSH_ALLOW ""; SSH_ALLOW=
+			firewall_apply
+			echo "SSH: any device on the Wi-Fi network may connect (an authorized key is still required)"
+			return
+		fi
+		list=
+		for a in "$@"; do
+			if [ "$a" = here ]; then
+				[ -n "${SSH_CONNECTION:-}" ] || { echo "'here' only works in an SSH session" >&2; exit 2; }
+				# The MAC: an address from DHCP can go to another device later. The address only
+				# when there is no MAC to see (a VPN, a routed network).
+				m=$(client_mac)
+				list="$list ${m:-$(client_ip)}"
+				continue
+			fi
+			if echo "$a" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then
+				list="$list $(echo "$a" | tr A-F a-f)"
+			elif python3 -c "import ipaddress,sys; ipaddress.ip_network(sys.argv[1], strict=False)" "$a" 2>/dev/null; then
+				list="$list $a"
+			else
+				echo "'$a' is not a MAC address, an IP address or a network" >&2; exit 2
+			fi
+		done
+		if [ $verb = allow ]; then
+			list="$SSH_ALLOW $list"
+		else
+			keep=
+			for a in $SSH_ALLOW; do
+				case " $list " in *" $a "*) ;; *) keep="$keep $a";; esac
+			done
+			list=$keep
+		fi
+		list=$(echo $list | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')
+		if [ $verb = deny ] && [ -z "$list" ]; then
+			echo "refused: that would empty the list, which opens SSH to any device; use 'penguin ssh allow any' for that" >&2
+			exit 1
+		fi
+		if [ -z "$force" ] && ! ssh_allow_check $list; then
+			echo "refused: this session's computer ($(client_ip) $(client_mac)) would not be in: $list" >&2
+			echo "add 'here', or use --force (then only the USB console or the screen can undo it)" >&2
+			exit 1
+		fi
+		set_setting SSH_ALLOW "$list"; SSH_ALLOW=$list
+		firewall_apply
+		echo "SSH: only $list may connect"
+		;;
+	keys) ssh_keys;;
+	*) echo "usage: penguin ssh [status | on | off | allow here|ADDR...|any | deny ADDR... | keys]" >&2; exit 2;;
+	esac
+}
+
 case "${1:-status}" in
 status) status;;
+ssh) shift; ssh_cmd "$@";;
 logs)
 	what=${2:-supervisor}; follow=
 	[ "${3:-}" = -f ] || [ "${2:-}" = -f ] && follow=1
@@ -49,13 +192,10 @@ settings) (set -a; . /etc/penguin/defaults.conf; [ -r $PENGUIN_DATA/settings.con
 set)
 	[ -n "${2:-}" ] && [ $# -ge 3 ] || { echo "usage: penguin set KEY VALUE" >&2; exit 2; }
 	grep -q "^$2=" /etc/penguin/defaults.conf || { echo "unknown setting $2 (see penguin settings)" >&2; exit 2; }
-	mkdir -p $PENGUIN_DATA
-	touch $PENGUIN_DATA/settings.conf
-	sed -i "/^$2=/d" $PENGUIN_DATA/settings.conf
-	printf '%s="%s"\n' "$2" "$3" >> $PENGUIN_DATA/settings.conf
+	set_setting "$2" "$3"
 	echo "$2=$3 (takes effect after: penguin restart; firewall settings: penguin firewall)"
 	;;
 restart) killall techo5 2>/dev/null; echo "supervisor restarting (init starts it again)";;
 firewall) /usr/local/sbin/techo5-firewall;;
-*) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
 esac

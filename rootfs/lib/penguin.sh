@@ -151,16 +151,27 @@ p_wifi_module() {
 		p_log wifi "could not stage the rebuilt driver"
 }
 
-# p_ssh: dropbear, keys only, whenever a key is on userdata. TECHO5's daemon used to decide this
-# from Home Assistant; here SSH is the way in, so it is always on (plan, Stage 5.2).
+# p_ssh: dropbear, keys only, whenever a key is on userdata and SSH is on (SSH, defaults.conf).
+# -s: no password logins at all; -g: none for root either; -T 3: three authentication attempts a
+# connection; -k: no remote forwarding. Local forwarding stays on, for SSH tunnels to services on the
+# unit (ssh -L). Who may connect is the firewall's (SSH_ALLOW, techo5-firewall).
+SSH_OPTS="-s -g -T 3 -k"
 p_ssh() {
 	keys=/data/misc/techo5/ssh/authorized_keys
+	if [ "${SSH:-on}" = off ]; then
+		killall dropbear 2>/dev/null
+		p_log ssh "SSH is off (SSH=off): USB console and the screen only"
+		return 0
+	fi
 	if [ ! -s $keys ]; then
 		p_log ssh "no key in $keys; SSH stays off (USB serial console only)"
 		return 0
 	fi
 	chmod 700 /data/misc/techo5/ssh; chmod 600 $keys
-	# -s: no password logins at all; -g: none for root either. Local forwarding stays on, for SSH
-	# tunnels to services on the unit (ssh -L).
-	t5_dropbear /data/techo5-linux/dropbear -s -g
+	if command -v t5_dropbear >/dev/null 2>&1; then
+		t5_dropbear /data/techo5-linux/dropbear $SSH_OPTS
+	elif ! pidof dropbear >/dev/null; then
+		# Outside boot.sh (penguin ssh on): -R makes host keys if missing, in /etc/dropbear (-> /data).
+		dropbear -R -p 22 $SSH_OPTS && p_log ssh "dropbear listening on :22"
+	fi
 }

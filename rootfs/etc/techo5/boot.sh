@@ -154,7 +154,8 @@ fi
 				t5_ntp
 				ntpd -S /etc/techo5/ntp-event.sh $(t5_ntp_peers) > /dev/null 2>&1
 			fi
-			pidof dropbear >/dev/null || p_ssh
+			# SSH as the settings say now (penguin ssh on/off), not as they were at boot.
+			( p_settings; [ "${SSH:-on}" = off ] || pidof dropbear >/dev/null || p_ssh )
 			[ -x /usr/local/sbin/techo5-net ] && /usr/local/sbin/techo5-net check
 			t5_wifi_prefer5
 			continue

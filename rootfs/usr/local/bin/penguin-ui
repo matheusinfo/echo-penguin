@@ -293,8 +293,9 @@ def ssh_lines():
     ]
     for kind, fp, comment in keys[:4]:
         lines.append(('', '%s  %s' % (comment[:24], fp[:39])))
-    lines.append(('Firewall', 'Wi-Fi inbound: SSH only%s' % (
-        ', +' + settings().get('LAN_PORTS') if settings().get('LAN_PORTS') else '')))
+    conf = settings()
+    lines[0] = ('SSH', 'OFF (SSH=off)' if conf.get('SSH') == 'off' else lines[0][1])
+    lines.append(('Allowed', conf.get('SSH_ALLOW') or 'any device on the Wi-Fi network'))
     return lines
 
 
@@ -407,6 +408,8 @@ class App:
         self.clocks = Clocks()
         self.beep_at = 0
         self.tx = self.ty = None
+        self.confirm, self.confirm_until = None, 0
+        self.cooldown_until = 0
         self.chvt(VT_UI)
 
     def open_input(self, name):
@@ -466,9 +469,9 @@ class App:
         self.scr.box(row, col, h, w, label, 1 if self.pressed == action else 0, sub)
         self.buttons.append((row, col, h, w, action))
 
-    def kv(self, lines, top=2):
+    def kv(self, lines, top=2, bottom=ROWS - 2):
         s = self.scr
-        for i, (k, v) in enumerate(lines[:ROWS - top - 2]):
+        for i, (k, v) in enumerate(lines[:bottom - top + 1]):
             s.text(top + i, 2, ('%-9s' % k)[:9], 2)
             s.text(top + i, 12, str(v)[:COLS - 13])
 
@@ -535,7 +538,21 @@ class App:
         self.draw_info('System', system_info, 3)
 
     def draw_ssh(self):
-        self.draw_info('Network & SSH', lambda: network_lines() + [('', '')] + ssh_lines(), 5)
+        if time.time() - self.info_at > 5:
+            self.info, self.info_at = network_lines() + ssh_lines(), time.time()
+        self.header('Network & SSH')
+        self.kv(self.info, 2, 15)
+        conf = settings()
+        on = conf.get('SSH', 'on') != 'off'
+        ask = self.confirm if time.time() < self.confirm_until else None
+        if ask == 'ssh-toggle':
+            label = 'Tap again: turn SSH %s' % ('OFF' if on else 'ON')
+        else:
+            label = 'SSH is ON  (tap to turn off)' if on else 'SSH is OFF  (tap to turn on)'
+        self.button(16, 2, 3, 38, label, 'ssh-toggle')
+        if conf.get('SSH_ALLOW'):
+            self.button(16, 42, 3, 36, 'Tap again: allow any' if ask == 'ssh-any' else 'Allow any device', 'ssh-any')
+        self.footer('SSH_ALLOW: %s' % (conf.get('SSH_ALLOW') or 'any device on the Wi-Fi (key required)'))
 
     def draw_installed(self):
         self.draw_info('Installed', installed_lines, 30)
@@ -653,6 +670,24 @@ class App:
             self.volume(10 if action == 'vol+' else -10)
         elif action == 'beep':
             subprocess.Popen(['penguin-sound', 'beep', '880', '250', '2'])
+        elif action in ('ssh-toggle', 'ssh-any'):
+            # Two taps: a stray touch must not cut SSH off, or open it to everyone. And none for
+            # 3 s after it acted, so the taps that follow it do not undo it.
+            if time.time() < self.cooldown_until:
+                return
+            if self.confirm == action and time.time() < self.confirm_until:
+                self.cooldown_until = time.time() + 3
+                self.confirm = None
+                if action == 'ssh-toggle':
+                    on = settings().get('SSH', 'on') != 'off'
+                    sh(['penguin', 'ssh', 'off' if on else 'on'], 10)
+                    self.say('SSH turned %s' % ('off' if on else 'on'))
+                else:
+                    sh(['penguin', 'ssh', 'allow', 'any'], 10)
+                    self.say('SSH: any device on the Wi-Fi may connect (key required)')
+                self.info_at = 0
+            else:
+                self.confirm, self.confirm_until = action, time.time() + 4
         elif action == 'dark':
             self.dark = True
             self.saved_bl = self.backlight()
