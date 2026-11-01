@@ -27,6 +27,7 @@ COLS, ROWS = 80, 21
 CELL_W, CELL_H = 12, 22          # SUN12x22, the console font (kernel/patches/0003)
 PANEL_SHORT = 480                # the panel is 480x960 portrait, mounted sideways
 VT_UI, VT_LOG = 1, 2
+KEEPALIVE = 0.45                 # s between display triggers, under the driver's 1 s idle threshold
 DATA = '/data/penguin'
 ALARM_FILE = DATA + '/alarm.json'
 SETTINGS = ('/etc/penguin/defaults.conf', DATA + '/settings.conf')
@@ -110,7 +111,20 @@ class Screen:
     def __init__(self, tty):
         self.out = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
         self.prev = [None] * ROWS
+        self.presented = 0
         self.clear()
+        # MediaTek's display does not scan the framebuffer continuously: what fbcon draws reaches
+        # the panel at its next frame update, often half-drawn. A pan with the same offsets after
+        # each frame makes the driver push the frame at once (primary_display_trigger). And its
+        # idle detector (display_idle_detect, every 1.5 s) drops the path to low power once 1 s
+        # passes without a trigger; leaving idle on the next frame is what made the clock stall
+        # for ~2 s, half-drawn. So the loop also pans every half second (KEEPALIVE) to stay out.
+        try:
+            self.fb = os.open('/dev/fb0', os.O_RDWR)
+            self.var = bytearray(160)
+            fcntl.ioctl(self.fb, 0x4600, self.var)  # FBIOGET_VSCREENINFO
+        except OSError:
+            self.fb = None
         # Cursor off, no line wrap, auto-repeat irrelevant; never blank.
         self.write('\033[?25l\033[?7l\033[9;0]\033[2J')
 
@@ -163,8 +177,25 @@ class Screen:
                     cur = attr
                 line.append(ch)
             out.append(''.join(line))
+        if not out and time.time() - self.presented > KEEPALIVE:
+            self.present()
         if out:
+            t0 = time.time()
             self.write(''.join(out) + '\033[0m')
+            t1 = time.time()
+            self.present()
+            if os.path.exists('/run/penguin/ui-debug'):
+                with open('/run/penguin/ui-frames.log', 'a') as f:
+                    f.write('%.3f rows=%d write=%.1fms pan=%.1fms\n' % (t0, len(out), (t1 - t0) * 1000,
+                                                                     (time.time() - t1) * 1000))
+
+    def present(self):
+        self.presented = time.time()
+        if self.fb is not None:
+            try:
+                fcntl.ioctl(self.fb, 0x4606, bytes(self.var))  # FBIOPAN_DISPLAY
+            except OSError:
+                pass
 
 
 # --- Data for the info screens.
@@ -714,7 +745,9 @@ class App:
                     subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
             self.draw()
             fast = self.view == 'clock' and self.tab == 'stopwatch' and self.clocks.sw_start
-            r, _, _ = select.select(fds, [], [], 0.1 if fast else 1 - time.time() % 1)
+            # Wake at each half second: the clock changes on the second, and the display needs a
+            # trigger well within each second to stay out of its idle mode (Screen.present).
+            r, _, _ = select.select(fds, [], [], 0.1 if fast else 0.5 - time.time() % 0.5 + 0.002)
             if self.touch in r:
                 self.read_touch()
             if self.keys in r:
