@@ -226,7 +226,13 @@ cleanup() {
 		done
 		n=$(docker images -qf dangling=true | wc -l)
 		[ "$n" -gt 0 ] && printf '  %9s  %s\n' '' "$n untagged image(s) left by rebuilds, and the build cache"
-		[ -n "$yes" ] && { docker image prune -f >/dev/null; docker builder prune -f >/dev/null 2>&1; }
+		if [ -n "$yes" ]; then
+			# Again while it deletes: an image whose child went is only untagged and unused now.
+			for i in 1 2 3 4; do
+				docker image prune -f | grep -q '^deleted:' || break
+			done
+			docker builder prune -f >/dev/null 2>&1
+		fi
 	fi
 
 	b=$(cat /run/techo5/slot 2>/dev/null)

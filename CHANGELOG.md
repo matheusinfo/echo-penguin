@@ -4,6 +4,11 @@ Versions are the root filesystem's (`/etc/techo5-release` on the unit, `-V` of `
 The boot images (kernels) are rebuilt alongside them; the changes to them are listed under the
 version that first needed them. Every version below ran on an Echo Show 5 2nd gen.
 
+## Unreleased
+
+- Fixed: `penguin cleanup --yes` left an untagged image whose child image it had just removed; it
+  took a second run. It now prunes again while that still deletes images.
+
 ## v0.2.7 — 2026-11-01
 
 - `penguin cleanup` lists what the unit no longer needs: installed rootfs tarballs, test files left
