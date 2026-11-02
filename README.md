@@ -23,7 +23,7 @@ without anyone touching it. It is built on top of the
 - [What you get](#what-you-get)
 - [Goals and non-goals](#goals-and-non-goals)
 - [Quick start](#quick-start)
-- [Using the Echo](#using-the-echo) ([Securing SSH](#securing-ssh))
+- [Using the Echo](#using-the-echo) ([The alarm's music](#the-alarms-music), [Securing SSH](#securing-ssh))
 - [How it works](#how-it-works)
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
@@ -43,8 +43,8 @@ without anyone touching it. It is built on top of the
 | **Containers** | Docker (overlay2, data on `/data/docker`) on the `docker` kernel |
 | **Reliability** | hardware watchdog, temperature guard, weekly restart, rotated logs, A/B system slots with automatic rollback |
 | **Security** | firewall closes everything on Wi-Fi except SSH and the ports you choose |
-| **Screen** | a touch interface (clock, alarm/stopwatch/timer, system, network & SSH, installed software, logs, brightness/volume); kernel and boot messages while it boots |
-| **Sound** | the built-in speaker (`penguin-sound`), the volume buttons |
+| **Screen** | a touch interface (clock, alarm with a beep or your own music, stopwatch, timer, system, network & SSH, installed software, logs, brightness/volume); kernel and boot messages while it boots |
+| **Sound** | the built-in speaker (`penguin-sound`: beeps, WAV and MP3), the volume buttons |
 
 Typical uses: a home lab node, a small self-hosted service, a Docker host for lightweight
 containers, an always-on SSH jump box.
@@ -185,15 +185,32 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 
 **The screen.** The home screen shows the time and six buttons: **Logs** (kernel errors, the boot
 log and every interactive SSH or USB-console session, live), **System**, **Network & SSH**,
-**Clock** (an alarm that repeats every day, on weekdays or weekends, or rings once; a stopwatch;
-a timer), **Installed** and **Display & sound** (brightness, volume, screen off). `< Back`
-returns. The volume buttons on top change the volume, or stop a ringing alarm. The interface is
-[penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on the kernel's framebuffer console,
-Python's standard library only.
+**Clock** (an alarm that repeats every day, on weekdays or weekends, or rings once, with a beep or
+[a track of yours](#the-alarms-music); a stopwatch; a timer), **Installed** and **Display & sound**
+(brightness, volume, screen off). `< Back` returns. The volume buttons on top change the volume, or
+stop a ringing alarm. The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on
+the kernel's framebuffer console, Python's standard library only.
 
-**Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav`,
+**Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav|file.mp3`,
 `penguin-sound volume [0-100]`. It holds the workaround the MediaTek playback driver needs (without
-it, the first sound panics the kernel), so use it rather than `aplay` directly.
+it, the first sound panics the kernel), so use it rather than `aplay` directly. One sound plays at a
+time: another one asked for meanwhile is skipped. SIGTERM stops a playback cleanly.
+
+### The alarm's music
+
+The alarm can play a track instead of the beep. Tracks live in `/data/penguin/music/`, so they
+survive system updates: `.mp3` and `.wav` files (the extension in any case), copied in over SSH:
+
+```bash
+ssh root@<ip> mkdir -p /data/penguin/music
+scp 'My song.mp3' root@<ip>:/data/penguin/music/
+```
+
+On the screen, Clock > Alarm > `Sound:` lists the built-in beep and every track in the folder (ten per page;
+new files show up without a restart). Tap one to choose it; `Play the chosen sound` previews it and
+`Stop` ends the preview. When the alarm rings, the track plays from the start, over and over, until
+you stop it or for ten minutes at most, and the screen shows its name. If the track cannot play (the
+file is gone or broken), the alarm beeps instead: it never stays silent. The timer always beeps.
 
 ### Securing SSH
 
@@ -284,7 +301,7 @@ eMMC (mmcblk0)
 │       ├── a/               a complete root filesystem   (a.state: good | trial N | bad)
 │       └── b/               the other one: where the next update goes
 └── userdata (p16) /data: everything that must survive updates
-    ├── penguin/             settings.conf, logs/
+    ├── penguin/             settings.conf, alarm.json, logs/, music/ (the alarm's tracks)
     ├── docker/              images, containers, volumes
     ├── techo5-linux/        boot logs, crash records, SSH host key, Wi-Fi credentials
     └── misc/techo5/ssh/     authorized_keys

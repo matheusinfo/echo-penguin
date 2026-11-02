@@ -8,7 +8,8 @@ buttons from gpio-keys.
 
 Screens: home (a large clock and six buttons), Logs (the log console, tty2: kernel errors, boot log
 and mirrored SSH/USB sessions, read back through /dev/vcs2 and shown under the header), System,
-Network & SSH, Clock (alarm, stopwatch, timer), Installed, Display & sound.
+Network & SSH, Clock (alarm, stopwatch, timer; the alarm's sound: a beep or a track from
+/data/penguin/music), Installed, Display & sound.
 """
 import base64
 import fcntl
@@ -30,6 +31,8 @@ VT_UI, VT_LOG = 1, 2
 KEEPALIVE = 0.45                 # s between display triggers, under the driver's 1 s idle threshold
 DATA = '/data/penguin'
 ALARM_FILE = DATA + '/alarm.json'
+MUSIC = DATA + '/music'           # the alarm's tracks: .mp3 and .wav files, copied in over SSH
+MUSIC_TYPES = ('.mp3', '.wav')
 SETTINGS = ('/etc/penguin/defaults.conf', DATA + '/settings.conf')
 
 EV_KEY, EV_ABS = 1, 3
@@ -332,13 +335,31 @@ def installed_lines():
 
 # --- Alarm, stopwatch and timer state.
 
+def music_files():
+    """The tracks the alarm can play, by name, sorted (Track 2 before Track 10)."""
+    try:
+        names = os.listdir(MUSIC)
+    except OSError:
+        return []
+    return sorted((n for n in names if n.lower().endswith(MUSIC_TYPES) and not n.startswith('.')
+                   and os.path.isfile(os.path.join(MUSIC, n))),
+                  key=lambda n: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', n)])
+
+
+def track_name(name, width):
+    """A track's file name for a label: without its extension, cut to width."""
+    name = os.path.splitext(name)[0]
+    return name if len(name) <= width else name[:width - 2] + '..'
+
+
 # The alarm's repeat modes, in the order the Repeat button cycles through them.
 REPEATS = {'daily': 'every day', 'weekdays': 'Mon to Fri', 'weekends': 'Sat and Sun', 'once': 'once'}
 
 
 class Clocks:
     def __init__(self):
-        self.alarm = {'on': False, 'h': 7, 'm': 0, 'repeat': 'daily'}
+        # sound: 'beep', or a file name in MUSIC.
+        self.alarm = {'on': False, 'h': 7, 'm': 0, 'repeat': 'daily', 'sound': 'beep'}
         try:
             with open(ALARM_FILE) as f:
                 self.alarm.update(json.load(f))
@@ -346,6 +367,8 @@ class Clocks:
             pass
         if self.alarm.get('repeat') not in REPEATS:
             self.alarm['repeat'] = 'daily'
+        if not isinstance(self.alarm.get('sound'), str) or '/' in self.alarm['sound']:
+            self.alarm['sound'] = 'beep'
         self.fired = None
         self.ringing = None          # what rings: 'alarm' | 'timer'
         self.ring_since = 0
@@ -394,6 +417,11 @@ class Clocks:
         """Whether the alarm rings on a weekday (0 = Monday)."""
         return {'weekdays': wday < 5, 'weekends': wday >= 5}.get(self.alarm['repeat'], True)
 
+    def music(self):
+        """The track the alarm plays, or None for the beep (also when the file is gone)."""
+        name = self.alarm['sound']
+        return name if name != 'beep' and os.path.isfile(os.path.join(MUSIC, name)) else None
+
     def until_alarm(self):
         now = time.localtime()
         today = now.tm_hour * 60 + now.tm_min
@@ -425,6 +453,12 @@ class App:
         self.dark = False
         self.clocks = Clocks()
         self.beep_at = 0
+        self.player = None           # penguin-sound playing a track, for 'ring' or 'preview'
+        self.player_for = None
+        self.player_since = 0
+        self.ring_seen = None        # the ring the sound below belongs to
+        self.music_failed = False    # this ring's track would not play: beep instead
+        self.sound_page = 0
         self.tx = self.ty = None
         self.down = False
         self.confirm, self.confirm_until = None, 0
@@ -612,7 +646,8 @@ class App:
                 self.button(12, 2 + i * 15, 3, 14, label, action)
             self.button(15, 2, 3, 24, 'Alarm is ON' if c.alarm['on'] else 'Alarm is OFF', 'alarm-toggle')
             self.button(15, 28, 3, 24, 'Repeat: ' + REPEATS[c.alarm['repeat']], 'alarm-repeat')
-            self.button(15, 54, 3, 24, 'Test sound', 'beep')
+            music = c.music()
+            self.button(15, 54, 3, 24, 'Sound: ' + (track_name(music, 15) if music else 'beep'), 'sound')
             self.footer('rings in %s, %s' % (c.until_alarm(), REPEATS[c.alarm['repeat']])
                         if c.alarm['on'] else 'alarm off')
         elif self.tab == 'stopwatch':
@@ -632,6 +667,29 @@ class App:
             self.button(15, 41, 3, 37, 'Reset', 't-reset')
             self.footer('timer running' if c.timer_end else '')
 
+    def draw_sound(self):
+        """The alarm's sound: the beep or one of the tracks in MUSIC, ten to a page."""
+        s = self.scr
+        c = self.clocks
+        self.header('Alarm sound')
+        items = ['beep'] + music_files()
+        pages = (len(items) + 9) // 10
+        self.sound_page = min(self.sound_page, pages - 1)
+        for i, name in enumerate(items[self.sound_page * 10:self.sound_page * 10 + 10]):
+            label = 'Beep (built in)' if name == 'beep' else track_name(name, 33)
+            chosen = name == (c.music() or 'beep')
+            row, col = 2 + (i % 5) * 3, 2 + (i // 5) * 39
+            self.scr.box(row, col, 3, 37, label, 1 if chosen or self.pressed == 'pick:' + name else 0)
+            self.buttons.append((row, col, 3, 37, 'pick:' + name))
+        if pages > 1:
+            self.button(17, 2, 3, 18, '< Prev', 'sound-prev')
+            self.button(17, 21, 3, 18, 'Next >', 'sound-next')
+        playing = self.player_for == 'preview' and self.player.poll() is None
+        self.button(17, 41, 3, 37, 'Stop' if playing else 'Play the chosen sound', 'sound-play')
+        page = 'page %d of %d, ' % (self.sound_page + 1, pages) if pages > 1 else ''
+        self.footer('%s: .mp3 and .wav files (copy them in over SSH)' % MUSIC if len(items) == 1
+                    else page + 'tap a track to choose it; files in %s' % MUSIC)
+
     def draw_ringing(self):
         s = self.scr
         what = 'ALARM' if self.clocks.ringing == 'alarm' else 'TIMER'
@@ -640,6 +698,8 @@ class App:
         s.center(3, what, 3)
         for i, line in enumerate(big(time.strftime('%H:%M'))):
             s.center(6 + i, line, 3)
+        if self.player_for == 'ring':
+            s.center(12, track_name(os.path.basename(self.player.args[-1]), COLS - 4), 3)
         s.center(14, 'tap anywhere to stop', 3)
         self.buttons.append((0, 0, ROWS, COLS, 'stop-ring'))
 
@@ -648,9 +708,29 @@ class App:
     def act(self, action):
         c = self.clocks
         if action == 'stop-ring':
-            c.ringing = None
+            self.stop_ring()
         elif action == 'back':
-            self.view = 'home'
+            if self.player_for == 'preview':
+                self.stop_player()
+            self.view = 'clock' if self.view == 'sound' else 'home'
+        elif action == 'sound':
+            self.view, self.sound_page = 'sound', 0
+        elif action.startswith('pick:'):
+            name = action[5:]
+            if self.player_for == 'preview':
+                self.stop_player()
+            c.alarm['sound'] = name
+            c.save()
+            self.say('alarm sound: %s' % ('beep' if name == 'beep' else track_name(name, 60)))
+        elif action in ('sound-prev', 'sound-next'):
+            self.sound_page = max(0, self.sound_page + (1 if action == 'sound-next' else -1))
+        elif action == 'sound-play':
+            if self.player_for == 'preview' and self.player.poll() is None:
+                self.stop_player()
+            elif c.music():
+                self.start_player(c.music(), 'preview')
+            else:
+                subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
         elif action in ('logs', 'system', 'ssh', 'installed', 'display', 'clock'):
             self.view, self.info_at = action, 0
         elif action.startswith('tab-'):
@@ -718,6 +798,56 @@ class App:
             self.dark = True
             self.saved_bl = self.backlight()
             self.backlight(0)
+
+    # The alarm's track, or a preview of it: one penguin-sound play at a time. SIGTERM stops it.
+
+    def start_player(self, name, what):
+        self.stop_player()
+        try:
+            self.player = subprocess.Popen(['penguin-sound', 'play', os.path.join(MUSIC, name)],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.player_for, self.player_since = what, time.time()
+        except OSError:
+            self.player = None
+
+    def stop_player(self):
+        p, self.player, self.player_for = self.player, None, None
+        if p and p.poll() is None:
+            # SIGTERM only, never SIGKILL: penguin-sound must close the held capture node itself,
+            # after its players (see its header). A slow one is left to finish on its own.
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def stop_ring(self):
+        self.clocks.ringing = None
+        if self.player_for == 'ring':
+            self.stop_player()
+
+    def ring_sound(self):
+        """Keep the ring sounding: the alarm's track, over and over, else beeps."""
+        c = self.clocks
+        if self.ring_seen != c.ring_since:  # a new ring: a preview gives way, the track gets a chance
+            self.ring_seen, self.music_failed = c.ring_since, False
+            if self.player_for == 'preview':
+                self.stop_player()
+        music = c.music() if c.ringing == 'alarm' else None
+        if music and not self.music_failed:
+            if self.player_for == 'ring' and self.player.poll() is None:
+                return
+            if self.player_for == 'ring' and (self.player.returncode or time.time() - self.player_since < 1):
+                # It stopped with an error or played nothing (no decoder, a broken file): beep instead,
+                # an alarm must not stay silent.
+                self.music_failed = True
+                self.player, self.player_for = None, None
+            else:
+                self.start_player(music, 'ring')  # the first time, or the track ended: from the top
+                return
+        if time.time() - self.beep_at > 1.5:
+            self.beep_at = time.time()
+            subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
 
     def volume(self, delta):
         cur = sh(['penguin-sound', 'volume'])
@@ -790,7 +920,7 @@ class App:
             _, _, etype, code, value = EVENT.unpack_from(data, i)
             if etype == EV_KEY and value == 1 and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
                 if self.clocks.ringing:
-                    self.clocks.ringing = None
+                    self.stop_ring()
                 else:
                     self.volume(10 if code == KEY_VOLUMEUP else -10)
                 self.draw()
@@ -804,10 +934,11 @@ class App:
                     self.dark = False
                     self.backlight(getattr(self, 'saved_bl', 90))
                 if time.time() - self.clocks.ring_since > 600:
-                    self.clocks.ringing = None  # ten minutes is enough
-                elif time.time() - self.beep_at > 1.5:
-                    self.beep_at = time.time()
-                    subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
+                    self.stop_ring()  # ten minutes is enough
+                else:
+                    self.ring_sound()
+            elif self.player_for == 'preview' and self.player.poll() is not None:
+                self.player, self.player_for = None, None  # the preview played to its end
             self.draw()
             fast = self.view == 'clock' and self.tab == 'stopwatch' and self.clocks.sw_start
             # Wake at each half second: the clock changes on the second, and the display needs a

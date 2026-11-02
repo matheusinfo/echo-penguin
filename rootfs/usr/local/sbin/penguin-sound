@@ -2,7 +2,7 @@
 """penguin-sound — the speaker, safely.
 
     penguin-sound beep [HZ [MS [COUNT]]]   a tone (default 880 Hz, 200 ms, once)
-    penguin-sound play FILE.wav            any WAV (converted by ALSA's plug layer)
+    penguin-sound play FILE                a WAV or MP3 file (MP3 decoded by mpg123); SIGTERM stops it
     penguin-sound volume [PERCENT]         show or set the amplifier volume (0-100)
 
 Playback is the MediaTek AFE's DL1 path, card 0 device 23 (S16_LE, stereo, 48 kHz). Two rules from
@@ -12,10 +12,16 @@ TECHO5's docs/hardware.md, both found the hard way on cronos:
     capture) is held open, unconfigured, for the whole playback.
   - never touch Ext_Speaker_Amp_Switch: on cronos it resets the amplifier, which then stays silent
     until a reboot. Volume goes through the amplifier's own digital volume only.
+
+Only one sound plays at a time: a second one, while another plays, is skipped rather than queued.
+SIGTERM stops a playback cleanly (the players first, the held capture node last), which is how
+penguin-ui stops the alarm's music.
 """
 import fcntl
 import math
 import os
+import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -24,6 +30,9 @@ import wave
 HOLD = '/dev/snd/pcmC0D1c'
 DEVICE = 'hw:0,23'
 RUN = '/run/penguin'
+RATE = 48000
+PLAY_LIMIT = 3600  # s: a stuck player must not hold the speaker forever
+APLAY = ['aplay', '-q', '--period-size=768', '--buffer-size=3072']
 # Volume controls by amplifier, as the kernel names them (cat /sys/bus/i2c/devices/2-*/name).
 VOLUME_CONTROLS = ('Master TAS5805m Playback Volume A',  # TI TAS5805M
                    'Digital Volume A')                    # Maxim MAX98396
@@ -84,6 +93,15 @@ def tone(hz, ms, path):
         w.writeframes(bytes(frames))
 
 
+def players(path, device):
+    """The commands that play a file: [aplay], or [decoder, aplay] with the decoder piped in."""
+    if path.lower().endswith('.mp3'):
+        # mpg123 decodes to what the DL1 path takes as is: S16_LE, stereo (mono is doubled), 48 kHz.
+        return [['mpg123', '-q', '-s', '-r', str(RATE), '--stereo', '-e', 's16', path],
+                APLAY + ['-D', device, '-t', 'raw', '-f', 'S16_LE', '-r', str(RATE), '-c', '2', '-']]
+    return [APLAY + ['-D', device, path]]
+
+
 def play(path, device):
     os.makedirs(RUN, exist_ok=True)
     with open(os.path.join(RUN, 'sound.lock'), 'w') as lock:
@@ -92,11 +110,33 @@ def play(path, device):
         except BlockingIOError:
             return 0  # something is already playing: skip rather than queue
         hold = os.open(HOLD, os.O_RDONLY)  # the SRAM-ring workaround, see the top of this file
+        procs = []
         try:
-            return subprocess.run(['aplay', '-q', '-D', device, '--period-size=768', '--buffer-size=3072', path],
-                                  timeout=600).returncode
+            cmds = players(path, device)
+            if len(cmds) == 2:
+                procs.append(subprocess.Popen(cmds[0], stdout=subprocess.PIPE))
+                procs.append(subprocess.Popen(cmds[1], stdin=procs[0].stdout))
+                procs[0].stdout.close()  # aplay holds the pipe now: the decoder sees it close with it
+            else:
+                procs.append(subprocess.Popen(cmds[0]))
+            rc = procs[-1].wait(timeout=PLAY_LIMIT)
+            return rc or procs[0].wait(timeout=5)
         finally:
+            # Stopped, failed or done: the players go first, the held node last (see the top).
+            for p in reversed(procs):
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait()
             os.close(hold)
+
+
+def stopped(signum, frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a second one must not cut the cleanup short
+    raise SystemExit(128 + signum)  # unwinds through play()'s cleanup
 
 
 def main(argv):
@@ -116,6 +156,10 @@ def main(argv):
                 return rc
         return 0
     if cmd == 'play' and len(argv) > 2:
+        if not os.path.isfile(argv[2]):
+            raise RuntimeError('no such file: %s' % argv[2])
+        if argv[2].lower().endswith('.mp3') and not shutil.which('mpg123'):
+            raise RuntimeError('mpg123 is not installed: MP3 needs it')
         return play(argv[2], 'plug' + DEVICE)
     if cmd == 'volume':
         print(volume(argv[2] if len(argv) > 2 else None))
@@ -125,6 +169,7 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, stopped)
     try:
         sys.exit(main(sys.argv))
     except (OSError, RuntimeError, subprocess.SubprocessError) as e:

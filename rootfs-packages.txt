@@ -29,3 +29,4 @@ tini-static
 # rebootto (reboot into fastboot for a kernel change) is a short Python script.
 python3               # penguin-ui (the touch interface), penguin-sound, rebootto
 alsa-utils            # aplay, amixer: the speaker (penguin-sound)
+mpg123                # MP3 decoding for penguin-sound play (the alarm's music)
