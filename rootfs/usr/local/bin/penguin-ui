@@ -58,13 +58,17 @@ DIGITS = {
 
 
 def big(text):
-    """Five lines of large characters for digits, ':' and '.'."""
+    """Five lines of large characters for digits, ':' and '.', all of the same width.
+
+    Callers center each line on its own, so the lines must not be trimmed: a line that ends in a
+    glyph's blank columns (the top of a 5, the middle of a 2) would be centered further right than
+    the others, and the digits drawn torn."""
     rows = [''] * 5
     for ch in text:
         glyph = DIGITS.get(ch, ['     '] * 5)
         for i in range(5):
             rows[i] += glyph[i] + ' '
-    return [r.rstrip() for r in rows]
+    return [r[:-1] for r in rows]
 
 
 def sh(cmd, timeout=4):

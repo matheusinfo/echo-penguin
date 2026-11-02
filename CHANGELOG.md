@@ -14,6 +14,10 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 - `penguin-sound play` takes MP3 as well as WAV, decoded by `mpg123` to 48 kHz stereo. SIGTERM
   stops a playback cleanly: the players first, the held capture node last.
 - New package: `mpg123` (with `mpg123-libs`).
+- Fixed: the big digits (clock, alarm, stopwatch, timer) were drawn torn whenever the last digit
+  was a 1, 2, 5, 6 or 7, e.g. the alarm at 05:25. Each line was trimmed of its trailing blanks and
+  then centered on its own, so lines that ended in a glyph's blank columns moved right. The panel,
+  long suspected, was never at fault.
 - Fixed: `penguin cleanup --yes` left an untagged image whose child image it had just removed; it
   took a second run. It now prunes again while that still deletes images.
 
