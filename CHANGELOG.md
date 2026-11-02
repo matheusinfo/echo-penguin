@@ -6,11 +6,15 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 
 ## Unreleased
 
+## v0.2.8 — 2026-11-02
+
+The alarm plays your music, and the big digits are no longer drawn torn.
+
 - The alarm can play music instead of the beep. Copy `.mp3` or `.wav` files into
-  `/data/penguin/music/` over SSH and choose one under Clock > Alarm > `Sound:` on the screen, which also
-  previews it. The track plays from the start, over and over, until the alarm is stopped (ten
-  minutes at most), and the ringing screen shows its name. A track that cannot play falls back to
-  the beep. The choice is kept in `/data/penguin/alarm.json`. The timer still beeps.
+  `/data/penguin/music/` over SSH and choose one under Clock > Alarm > `Sound:` on the screen,
+  which also previews it. The track plays from the start, over and over, until the alarm is stopped
+  (ten minutes at most), and the ringing screen shows its name. A track that cannot play falls back
+  to the beep. The choice is kept in `/data/penguin/alarm.json`. The timer still beeps.
 - `penguin-sound play` takes MP3 as well as WAV, decoded by `mpg123` to 48 kHz stereo. SIGTERM
   stops a playback cleanly: the players first, the held capture node last.
 - New package: `mpg123` (with `mpg123-libs`).
