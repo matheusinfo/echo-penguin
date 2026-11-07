@@ -8,13 +8,15 @@ buttons from gpio-keys.
 
 Screens: home (a large clock and six buttons), Logs (the log console, tty2: kernel errors, boot log
 and mirrored SSH/USB sessions, read back through /dev/vcs2 and shown under the header), System,
-Network & SSH, Clock (alarm, stopwatch, timer; the alarm's sound: a beep or a track from
-/data/penguin/music), Installed, Display & sound.
+Network & SSH, Clock (alarms, stopwatch, timer; each alarm's sound: a beep or a track from
+/data/penguin/music), Installed, Display & sound (brightness, which follows the room's light sensor
+with AUTO_BRIGHTNESS=1, and volume).
 """
 import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -30,10 +32,19 @@ PANEL_SHORT = 480                # the panel is 480x960 portrait, mounted sidewa
 VT_UI, VT_LOG = 1, 2
 KEEPALIVE = 0.45                 # s between display triggers, under the driver's 1 s idle threshold
 DATA = '/data/penguin'
-ALARM_FILE = DATA + '/alarm.json'
+# The alarms: {"alarms": [{"on", "h", "m", "repeat", "sound"}, ...]}, reloaded when the file changes
+# (echo-manager writes it too). Versions up to v0.2.8 kept one alarm in alarm.json: it is read once,
+# when alarms.json does not exist yet, and left in place for a rollback to an older slot.
+ALARMS_FILE = DATA + '/alarms.json'
+OLD_ALARM_FILE = DATA + '/alarm.json'
+MAX_ALARMS = 8
 MUSIC = DATA + '/music'           # the alarm's tracks: .mp3 and .wav files, copied in over SSH
 MUSIC_TYPES = ('.mp3', '.wav')
 SETTINGS = ('/etc/penguin/defaults.conf', DATA + '/settings.conf')
+BACKLIGHT_FILE = '/sys/class/leds/lcd-backlight/brightness'
+# The ambient light sensor: a JSA1214 (I2C 0-0044), driven by a vendor driver with stk3x1x names.
+# Reading 'als' returns the current count (0-4095, more light = more); 'send' writes a register.
+ALS_DIR = '/sys/bus/platform/drivers/als_ps'
 
 EV_KEY, EV_ABS = 1, 3
 ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x35, 0x36, 0x39
@@ -337,10 +348,10 @@ def installed_lines():
     return lines
 
 
-# --- Alarm, stopwatch and timer state.
+# --- Alarms, stopwatch and timer state.
 
 def music_files():
-    """The tracks the alarm can play, by name, sorted (Track 2 before Track 10)."""
+    """The tracks an alarm can play, by name, sorted (Track 2 before Track 10)."""
     try:
         names = os.listdir(MUSIC)
     except OSError:
@@ -356,25 +367,69 @@ def track_name(name, width):
     return name if len(name) <= width else name[:width - 2] + '..'
 
 
-# The alarm's repeat modes, in the order the Repeat button cycles through them.
+# The repeat modes, in the order the Repeat button cycles through them.
 REPEATS = {'daily': 'every day', 'weekdays': 'Mon to Fri', 'weekends': 'Sat and Sun', 'once': 'once'}
+
+
+def new_alarm():
+    return {'on': True, 'h': 7, 'm': 0, 'repeat': 'daily', 'sound': 'beep'}
+
+
+def clean_alarm(raw):
+    """An alarm from the file with every field valid, or None when it cannot be one."""
+    if not isinstance(raw, dict):
+        return None
+    a = {'on': False, 'h': 7, 'm': 0, 'repeat': 'daily', 'sound': 'beep'}
+    a.update((k, raw[k]) for k in a if k in raw)
+    try:
+        a['h'], a['m'] = int(a['h']) % 24, int(a['m']) % 60
+    except (TypeError, ValueError):
+        return None
+    a['on'] = a['on'] is True
+    if a['repeat'] not in REPEATS:
+        a['repeat'] = 'daily'
+    # sound: 'beep', or a file name in MUSIC.
+    if not isinstance(a['sound'], str) or not a['sound'] or '/' in a['sound']:
+        a['sound'] = 'beep'
+    return a
+
+
+def rings_on(alarm, wday):
+    """Whether an alarm rings on a weekday (0 = Monday)."""
+    return {'weekdays': wday < 5, 'weekends': wday >= 5}.get(alarm['repeat'], True)
+
+
+def until(alarm, now=None):
+    """Minutes until an alarm next rings (the current minute counts as gone)."""
+    now = now or time.localtime()
+    today = now.tm_hour * 60 + now.tm_min
+    mins = (alarm['h'] * 60 + alarm['m']) - today
+    if mins <= 0:
+        mins += 24 * 60
+    while not rings_on(alarm, (now.tm_wday + (today + mins) // (24 * 60)) % 7):
+        mins += 24 * 60
+    return mins
+
+
+def span(mins):
+    days, mins = mins // (24 * 60), mins % (24 * 60)
+    return ('%d d ' % days if days else '') + '%d h %02d min' % (mins // 60, mins % 60)
+
+
+def music_of(alarm):
+    """The track an alarm plays, or None for the beep (also when the file is gone)."""
+    name = alarm['sound']
+    return name if name != 'beep' and os.path.isfile(os.path.join(MUSIC, name)) else None
 
 
 class Clocks:
     def __init__(self):
-        # sound: 'beep', or a file name in MUSIC.
-        self.alarm = {'on': False, 'h': 7, 'm': 0, 'repeat': 'daily', 'sound': 'beep'}
-        try:
-            with open(ALARM_FILE) as f:
-                self.alarm.update(json.load(f))
-        except (OSError, ValueError):
-            pass
-        if self.alarm.get('repeat') not in REPEATS:
-            self.alarm['repeat'] = 'daily'
-        if not isinstance(self.alarm.get('sound'), str) or '/' in self.alarm['sound']:
-            self.alarm['sound'] = 'beep'
+        self.alarms = []
+        self.stamp = None            # (mtime, size) of ALARMS_FILE as last read or written
+        self.load()
         self.fired = None
         self.ringing = None          # what rings: 'alarm' | 'timer'
+        self.ring_alarm = None       # the alarm that rings (a copy)
         self.ring_since = 0
         self.sw_start = None         # stopwatch
         self.sw_acc = 0.0
@@ -382,14 +437,57 @@ class Clocks:
         self.timer_end = None
         self.timer_left = 300
 
+    def file_stamp(self):
+        try:
+            st = os.stat(ALARMS_FILE)
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def load(self):
+        """Read the alarms. A file that does not parse (half written?) keeps the current ones."""
+        stamp = self.file_stamp()
+        path = ALARMS_FILE if stamp else OLD_ALARM_FILE
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except OSError:
+            data = {}
+        except ValueError:
+            if stamp:
+                return False
+            data = {}
+        if path == OLD_ALARM_FILE:
+            items = [data] if data else []
+        else:
+            items = data.get('alarms') if isinstance(data, dict) else data
+        alarms = [a for a in (clean_alarm(x) for x in (items if isinstance(items, list) else [])) if a]
+        self.alarms, self.stamp = alarms[:MAX_ALARMS], stamp
+        return True
+
+    def reload_if_changed(self):
+        """True when the file changed on disk (written by echo-manager or by hand) and was reloaded."""
+        stamp = self.file_stamp()
+        return stamp is not None and stamp != self.stamp and self.load()
+
     def save(self):
         try:
             os.makedirs(DATA, exist_ok=True)
-            with open(ALARM_FILE + '.tmp', 'w') as f:
-                json.dump(self.alarm, f)
-            os.rename(ALARM_FILE + '.tmp', ALARM_FILE)
+            with open(ALARMS_FILE + '.tmp', 'w') as f:
+                json.dump({'alarms': self.alarms}, f)
+            os.rename(ALARMS_FILE + '.tmp', ALARMS_FILE)
+            self.stamp = self.file_stamp()
         except OSError:
             pass
+
+    def sort(self):
+        self.alarms.sort(key=lambda a: (a['h'], a['m']))
+
+    def next_alarm(self):
+        """(minutes, alarm) of the next alarm to ring, or None when all are off."""
+        now = time.localtime()
+        on = [(until(a, now), a) for a in self.alarms if a['on']]
+        return min(on, key=lambda x: x[0]) if on else None
 
     def stopwatch(self):
         return self.sw_acc + (time.time() - self.sw_start if self.sw_start else 0)
@@ -398,44 +496,79 @@ class Clocks:
         return max(0, self.timer_end - time.time()) if self.timer_end else self.timer_left
 
     def tick(self):
-        """Start ringing when the alarm or the timer is due."""
+        """Start ringing when an alarm or the timer is due."""
         now = time.localtime()
         key = (now.tm_yday, now.tm_hour, now.tm_min)
-        if (self.alarm['on'] and (now.tm_hour, now.tm_min) == (self.alarm['h'], self.alarm['m'])
-                and self.rings_on(now.tm_wday) and self.fired != key):
-            self.fired = key
-            self.ring('alarm')
-            if self.alarm['repeat'] == 'once':
-                self.alarm['on'] = False
-                self.save()
+        if self.fired != key:
+            due = [a for a in self.alarms if a['on'] and (a['h'], a['m']) == (now.tm_hour, now.tm_min)
+                   and rings_on(a, now.tm_wday)]
+            if due:
+                # Several alarms at the same minute ring once, with a track if one of them has one.
+                self.fired = key
+                self.ring('alarm', next((a for a in due if music_of(a)), due[0]))
+                once = [a for a in due if a['repeat'] == 'once']
+                for a in once:
+                    a['on'] = False
+                if once:
+                    self.save()
         if self.timer_end and time.time() >= self.timer_end:
             self.timer_end = None
             self.timer_left = self.timer_set
             self.ring('timer')
 
-    def ring(self, what):
+    def ring(self, what, alarm=None):
         self.ringing = what
+        self.ring_alarm = dict(alarm) if alarm else None
         self.ring_since = time.time()
 
-    def rings_on(self, wday):
-        """Whether the alarm rings on a weekday (0 = Monday)."""
-        return {'weekdays': wday < 5, 'weekends': wday >= 5}.get(self.alarm['repeat'], True)
-
     def music(self):
-        """The track the alarm plays, or None for the beep (also when the file is gone)."""
-        name = self.alarm['sound']
-        return name if name != 'beep' and os.path.isfile(os.path.join(MUSIC, name)) else None
+        """The track the ringing alarm plays, or None for the beep."""
+        return music_of(self.ring_alarm) if self.ringing == 'alarm' and self.ring_alarm else None
 
-    def until_alarm(self):
-        now = time.localtime()
-        today = now.tm_hour * 60 + now.tm_min
-        mins = (self.alarm['h'] * 60 + self.alarm['m']) - today
-        if mins <= 0:
-            mins += 24 * 60
-        while not self.rings_on((now.tm_wday + (today + mins) // (24 * 60)) % 7):
-            mins += 24 * 60
-        days, mins = mins // (24 * 60), mins % (24 * 60)
-        return ('%d d ' % days if days else '') + '%d h %02d min' % (mins // 60, mins % 60)
+
+# --- Automatic brightness.
+
+class Light:
+    """The room's light, from the ambient light sensor, smoothed: the median of the last readings."""
+
+    def __init__(self):
+        self.samples = []
+        self.read_at = 0
+        self.value = None            # None: no sensor
+        self.changed_at = time.time()
+        self.enable()
+
+    def enable(self):
+        """Turn the sensor's light measurement on. The vendor driver leaves it off at times (bit 2 of
+        the configuration register 0x01 clear: the count then stays frozen). 0x04 = light on,
+        proximity off (unused here)."""
+        try:
+            with open(ALS_DIR + '/send', 'w') as f:
+                f.write('1 4')
+        except OSError:
+            pass
+
+    def poll(self):
+        """Read the sensor once a second; the median of five ignores a hand passing by."""
+        if time.time() - self.read_at < 1:
+            return self.value
+        self.read_at = time.time()
+        raw = read(ALS_DIR + '/als')
+        try:
+            v = int(raw, 16) if raw.startswith('0x') else int(raw)
+        except ValueError:
+            self.value = None
+            return None
+        if self.samples and v != self.samples[-1]:
+            self.changed_at = time.time()
+        elif time.time() - self.changed_at > 600:
+            # Ten minutes without the smallest change: the measurement may have been turned off
+            # again (a frozen count). Turning it on is harmless when it was on.
+            self.enable()
+            self.changed_at = time.time()
+        self.samples = (self.samples + [v])[-5:]
+        self.value = sorted(self.samples)[len(self.samples) // 2]
+        return self.value
 
 
 # --- The application.
@@ -455,7 +588,14 @@ class App:
         self.toast = ''
         self.toast_until = 0
         self.dark = False
+        self.saved_bl = 90           # the level to come back to after Screen off
+        self.conf, self.conf_at = settings(), time.time()
+        self.light = Light()
+        self.bl_set = None           # the level this process last wrote
+        self.bl_goal = None          # where automatic brightness is heading
+        self.hold_level, self.hold_until = 0, 0  # a level shown for a moment while it is adjusted
         self.clocks = Clocks()
+        self.edit = 0                # the alarm open in the editor (index in clocks.alarms)
         self.beep_at = 0
         self.player = None           # penguin-sound playing a track, for 'ring' or 'preview'
         self.player_for = None
@@ -486,16 +626,101 @@ class App:
     # Settings that persist go through `penguin set`, so `penguin settings` shows them.
     def set_setting(self, key, value):
         sh(['penguin', 'set', key, str(value)])
+        self.conf[key] = str(value)  # at once, not at the next read of the files
 
     def backlight(self, level=None):
-        f = '/sys/class/leds/lcd-backlight/brightness'
         if level is None:
-            return int(read(f, '90') or 90)
+            try:
+                return int(read(BACKLIGHT_FILE, '90'))
+            except ValueError:
+                return 90
+        self.bl_set = level
         try:
-            with open(f, 'w') as fh:
+            with open(BACKLIGHT_FILE, 'w') as fh:
                 fh.write(str(level))
         except OSError:
             pass
+
+    # Brightness: fixed at BACKLIGHT, or (AUTO_BRIGHTNESS=1) following the room's light between
+    # BACKLIGHT_DARK and BACKLIGHT. Settings are read again every few seconds: echo-manager and
+    # `penguin set` change them without restarting this process.
+
+    def setting_int(self, key, default, lo=0, hi=255):
+        try:
+            return max(lo, min(hi, int(self.conf.get(key, default))))
+        except ValueError:
+            return default
+
+    def auto_wanted(self):
+        return self.conf.get('AUTO_BRIGHTNESS', '0') == '1' and self.setting_int('BACKLIGHT', 90) > 0
+
+    def auto_range(self):
+        hi = max(1, self.setting_int('BACKLIGHT', 90))
+        return min(hi, self.setting_int('BACKLIGHT_DARK', 10, 1)), hi
+
+    def auto_target(self):
+        """The level for the room's light now: BACKLIGHT_DARK up to a reading of LIGHT_DARK, BACKLIGHT
+        from LIGHT_BRIGHT up, in between along a log scale (closer to how the eye sees it)."""
+        lo, hi = self.auto_range()
+        dark = self.setting_int('LIGHT_DARK', 3, 0, 4095)
+        bright = max(dark + 1, self.setting_int('LIGHT_BRIGHT', 80, 1, 4095))
+        f = (math.log1p(self.light.value) - math.log1p(dark)) / (math.log1p(bright) - math.log1p(dark))
+        return round(lo + max(0.0, min(1.0, f)) * (hi - lo))
+
+    def follow_light(self):
+        """Called every loop: notice a screen turned off from outside, and with automatic brightness,
+        move the backlight toward the room's level a quarter of the way at a time (a short fade)."""
+        if time.time() - self.conf_at > 5:
+            self.conf, self.conf_at = settings(), time.time()
+        cur = self.backlight()
+        if self.dark:
+            if cur > 0 and self.bl_set == 0:
+                self.wake(cur)  # turned back on from outside: show the interface again
+            return
+        if cur == 0 and self.bl_set != 0:
+            # Turned off by echo-manager or over SSH: dark, as after Screen off, so a tap wakes it.
+            self.go_dark(self.bl_set or self.setting_int('BACKLIGHT', 90) or 90)
+            return
+        if not self.auto_wanted() or self.light.poll() is None:
+            self.bl_set = cur
+            return
+        if time.time() < self.hold_until:
+            goal = self.hold_level
+        else:
+            goal = self.auto_target()
+            # Hysteresis: small changes in the room's light leave the level alone, so the screen does
+            # not wander; the ends of the range are always reached.
+            if (self.bl_goal is not None and abs(goal - self.bl_goal) < max(3, self.bl_goal // 8)
+                    and goal not in self.auto_range()):
+                goal = self.bl_goal
+        self.bl_goal = goal
+        if cur != goal:
+            step = max(1, abs(goal - cur) // 4)
+            self.backlight(cur + step if goal > cur else cur - step)
+
+    def show_level(self, level):
+        """While a level is adjusted, show it for a few seconds, whatever the room's light."""
+        self.hold_level, self.hold_until = level, time.time() + 4
+        self.backlight(level)
+
+    def go_dark(self, saved):
+        self.dark, self.saved_bl = True, saved
+        self.backlight(0)
+
+    def wake(self, level=None):
+        """Screen on again: at the level given, else the room's (automatic) or the one before."""
+        self.dark = False
+        try:
+            with open('/sys/class/graphics/fb0/blank', 'w') as f:  # BACKLIGHT=0 at boot blanks it
+                f.write('0')
+        except OSError:
+            pass
+        self.light.samples, self.bl_goal = [], None
+        if level is None:
+            level = (self.auto_target() if self.auto_wanted() and self.light.poll() is not None
+                     else self.saved_bl or 90)
+        self.backlight(level)
+        self.scr.flush(force=True)
 
     # Drawing -------------------------------------------------------------------------------
 
@@ -551,9 +776,9 @@ class App:
         for i, line in enumerate(big(time.strftime('%H:%M:%S'))):
             s.center(2 + i, line, 2)
         status = time.strftime('%A, %d %B %Y')
-        if self.clocks.alarm['on']:
-            status += '   ·   alarm %02d:%02d, %s' % (self.clocks.alarm['h'], self.clocks.alarm['m'],
-                                                    REPEATS[self.clocks.alarm['repeat']])
+        nxt = self.clocks.next_alarm()
+        if nxt:
+            status += '   ·   next alarm %02d:%02d, %s' % (nxt[1]['h'], nxt[1]['m'], REPEATS[nxt[1]['repeat']])
         s.center(8, status)
         w, gap = 25, 1
         x0 = (COLS - 3 * w - 2 * gap) // 2
@@ -620,20 +845,39 @@ class App:
         self.header('Display & sound')
         bl = self.backlight()
         vol = sh(['penguin-sound', 'volume']) or '?'
-        s.text(3, 4, 'Brightness', 2)
-        s.text(3, 20, '%3d / 255' % bl)
-        self.button(5, 4, 3, 16, '-', 'bl-')
-        self.button(5, 22, 3, 16, '+', 'bl+')
-        s.text(3, 44, 'Volume', 2)
-        s.text(3, 60, '%s %%' % vol)
-        self.button(5, 44, 3, 16, '-', 'vol-')
-        self.button(5, 62, 3, 16, '+', 'vol+')
-        self.button(10, 4, 3, 34, 'Test sound', 'beep')
-        self.button(10, 44, 3, 34, 'Screen off', 'dark')
-        s.text(15, 4, 'Screen off: the panel goes dark; a tap brings it back.')
-        s.text(16, 4, 'The volume buttons on top of the Echo change the volume too.')
-        s.text(17, 4, 'Both are kept across reboots (penguin settings).')
-        self.footer('')
+        auto = self.auto_wanted()
+        if auto:
+            lo, hi = self.auto_range()
+            s.text(2, 4, 'Lit room', 2)
+            s.text(2, 22, '%3d / 255' % hi)
+            self.button(3, 4, 3, 16, '-', 'bl-')
+            self.button(3, 22, 3, 16, '+', 'bl+')
+            s.text(7, 4, 'Dark room', 2)
+            s.text(7, 22, '%3d / 255' % lo)
+            self.button(8, 4, 3, 16, '-', 'dark-')
+            self.button(8, 22, 3, 16, '+', 'dark+')
+        else:
+            s.text(2, 4, 'Brightness', 2)
+            s.text(2, 22, '%3d / 255' % bl)
+            self.button(3, 4, 3, 16, '-', 'bl-')
+            self.button(3, 22, 3, 16, '+', 'bl+')
+        self.button(12, 4, 3, 34, 'Auto brightness: ' + ('ON' if auto else 'OFF'), 'auto-bl')
+        s.text(2, 44, 'Volume', 2)
+        s.text(2, 60, '%s %%' % vol)
+        self.button(3, 44, 3, 16, '-', 'vol-')
+        self.button(3, 62, 3, 16, '+', 'vol+')
+        self.button(8, 44, 3, 34, 'Test sound', 'beep')
+        self.button(12, 44, 3, 34, 'Screen off', 'dark')
+        light = self.light.poll()
+        room = 'no light sensor' if light is None else 'room light %d' % light
+        if auto:
+            s.text(16, 4, 'The screen follows the room: %d / 255 now (%s).' % (bl, room))
+            s.text(17, 4, 'Lit room: its level by day; Dark room: when the lights go off.')
+        else:
+            s.text(16, 4, 'Auto brightness is off: the screen stays at this level (%s).' % room)
+            s.text(17, 4, 'Turn it on to dim the screen when the room goes dark.')
+        s.text(18, 4, 'Screen off: the panel goes dark; a tap brings it back.')
+        self.footer('kept across reboots (penguin settings); the volume buttons on top change the volume')
 
     def draw_clock(self):
         s = self.scr
@@ -643,17 +887,7 @@ class App:
             self.scr.box(2, 2 + i * 26, 3, 24, label, 1 if self.tab == tab else 0)
             self.buttons.append((2, 2 + i * 26, 3, 24, 'tab-' + tab))
         if self.tab == 'alarm':
-            for i, line in enumerate(big('%02d:%02d' % (c.alarm['h'], c.alarm['m']))):
-                s.center(6 + i, line, 2)
-            for i, (label, action) in enumerate((('Hour +', 'h+'), ('Hour -', 'h-'), ('Min +10', 'm+10'),
-                                                 ('Min +1', 'm+'), ('Min -1', 'm-'))):
-                self.button(12, 2 + i * 15, 3, 14, label, action)
-            self.button(15, 2, 3, 24, 'Alarm is ON' if c.alarm['on'] else 'Alarm is OFF', 'alarm-toggle')
-            self.button(15, 28, 3, 24, 'Repeat: ' + REPEATS[c.alarm['repeat']], 'alarm-repeat')
-            music = c.music()
-            self.button(15, 54, 3, 24, 'Sound: ' + (track_name(music, 15) if music else 'beep'), 'sound')
-            self.footer('rings in %s, %s' % (c.until_alarm(), REPEATS[c.alarm['repeat']])
-                        if c.alarm['on'] else 'alarm off')
+            self.draw_alarm_list()
         elif self.tab == 'stopwatch':
             t = c.stopwatch()
             for i, line in enumerate(big('%02d:%02d.%d' % (t // 60, t % 60, (t * 10) % 10))):
@@ -671,17 +905,58 @@ class App:
             self.button(15, 41, 3, 37, 'Reset', 't-reset')
             self.footer('timer running' if c.timer_end else '')
 
-    def draw_sound(self):
-        """The alarm's sound: the beep or one of the tracks in MUSIC, ten to a page."""
+    def draw_alarm_list(self):
+        """The alarms, four to a column: tap one to change it, its ON/OFF to switch it."""
         s = self.scr
         c = self.clocks
-        self.header('Alarm sound')
+        if not c.alarms:
+            s.center(8, 'No alarms yet.', 2)
+            s.center(10, 'Add one, then set its time, the days it rings and its sound.')
+        for i, a in enumerate(c.alarms):
+            row, col = 5 + (i % 4) * 3, 2 + (i // 4) * 39
+            music = music_of(a)
+            label = '%02d:%02d  %s' % (a['h'], a['m'], REPEATS[a['repeat']]) + ('  music' if music else '')
+            self.button(row, col, 3, 28, label, 'edit:%d' % i)
+            self.scr.box(row, col + 29, 3, 8, 'ON' if a['on'] else 'off',
+                         1 if a['on'] != (self.pressed == 'switch:%d' % i) else 0)
+            self.buttons.append((row, col + 29, 3, 8, 'switch:%d' % i))
+        if len(c.alarms) < MAX_ALARMS:
+            self.button(17, 2 if c.alarms else 22, 3, 37 if c.alarms else 36, '+ Add an alarm', 'alarm-add')
+        nxt = c.next_alarm()
+        self.footer('next: %02d:%02d, in %s' % (nxt[1]['h'], nxt[1]['m'], span(nxt[0])) if nxt
+                    else 'all alarms are off' if c.alarms else '')
+
+    def draw_alarm(self):
+        """One alarm: its time, on/off, repeat and sound; Delete asks for a second tap."""
+        s = self.scr
+        c = self.clocks
+        a = c.alarms[self.edit]
+        self.header('Alarm %d of %d' % (self.edit + 1, len(c.alarms)))
+        for i, line in enumerate(big('%02d:%02d' % (a['h'], a['m']))):
+            s.center(2 + i, line, 2)
+        for i, (label, action) in enumerate((('Hour +', 'h+'), ('Hour -', 'h-'), ('Min +10', 'm+10'),
+                                             ('Min +1', 'm+'), ('Min -1', 'm-'))):
+            self.button(8, 2 + i * 15, 3, 14, label, action)
+        self.button(11, 2, 3, 24, 'Alarm is ON' if a['on'] else 'Alarm is OFF', 'alarm-toggle')
+        self.button(11, 28, 3, 24, 'Repeat: ' + REPEATS[a['repeat']], 'alarm-repeat')
+        music = music_of(a)
+        self.button(11, 54, 3, 24, 'Sound: ' + (track_name(music, 15) if music else 'beep'), 'sound')
+        ask = self.confirm == 'alarm-delete' and time.time() < self.confirm_until
+        self.button(15, 2, 3, 24, 'Tap again to delete' if ask else 'Delete', 'alarm-delete')
+        self.button(15, 54, 3, 24, 'Done', 'back')
+        self.footer('rings in %s, %s' % (span(until(a)), REPEATS[a['repeat']]) if a['on'] else 'this alarm is off')
+
+    def draw_sound(self):
+        """An alarm's sound: the beep or one of the tracks in MUSIC, ten to a page."""
+        s = self.scr
+        a = self.clocks.alarms[self.edit]
+        self.header('Alarm %d: sound' % (self.edit + 1))
         items = ['beep'] + music_files()
         pages = (len(items) + 9) // 10
         self.sound_page = min(self.sound_page, pages - 1)
         for i, name in enumerate(items[self.sound_page * 10:self.sound_page * 10 + 10]):
             label = 'Beep (built in)' if name == 'beep' else track_name(name, 33)
-            chosen = name == (c.music() or 'beep')
+            chosen = name == (music_of(a) or 'beep')
             row, col = 2 + (i % 5) * 3, 2 + (i // 5) * 39
             self.scr.box(row, col, 3, 37, label, 1 if chosen or self.pressed == 'pick:' + name else 0)
             self.buttons.append((row, col, 3, 37, 'pick:' + name))
@@ -716,42 +991,73 @@ class App:
         elif action == 'back':
             if self.player_for == 'preview':
                 self.stop_player()
-            self.view = 'clock' if self.view == 'sound' else 'home'
+            if self.view == 'alarm':
+                # Leaving an alarm: the list stays in time order.
+                c.sort()
+                c.save()
+            self.view = {'sound': 'alarm', 'alarm': 'clock'}.get(self.view, 'home')
         elif action == 'sound':
             self.view, self.sound_page = 'sound', 0
         elif action.startswith('pick:'):
             name = action[5:]
             if self.player_for == 'preview':
                 self.stop_player()
-            c.alarm['sound'] = name
+            c.alarms[self.edit]['sound'] = name
             c.save()
             self.say('alarm sound: %s' % ('beep' if name == 'beep' else track_name(name, 60)))
         elif action in ('sound-prev', 'sound-next'):
             self.sound_page = max(0, self.sound_page + (1 if action == 'sound-next' else -1))
         elif action == 'sound-play':
+            music = music_of(c.alarms[self.edit])
             if self.player_for == 'preview' and self.player.poll() is None:
                 self.stop_player()
-            elif c.music():
-                self.start_player(c.music(), 'preview')
+            elif music:
+                self.start_player(music, 'preview')
             else:
                 subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
+        elif action.startswith('edit:'):
+            self.view, self.edit, self.confirm = 'alarm', int(action[5:]), None
+        elif action.startswith('switch:'):
+            a = c.alarms[int(action[7:])]
+            a['on'] = not a['on']
+            c.save()
+            self.say('%02d:%02d on: rings in %s' % (a['h'], a['m'], span(until(a))) if a['on']
+                     else '%02d:%02d off' % (a['h'], a['m']))
+        elif action == 'alarm-add':
+            if len(c.alarms) < MAX_ALARMS:
+                c.alarms.append(new_alarm())
+                c.save()
+                self.view, self.edit, self.confirm = 'alarm', len(c.alarms) - 1, None
+                self.say('new alarm: set its time')
+        elif action == 'alarm-delete':
+            if self.confirm == action and time.time() < self.confirm_until:
+                a = c.alarms.pop(self.edit)
+                c.save()
+                self.confirm, self.view = None, 'clock'
+                self.say('alarm %02d:%02d deleted' % (a['h'], a['m']))
+            else:
+                self.confirm, self.confirm_until = action, time.time() + 4
         elif action in ('logs', 'system', 'ssh', 'installed', 'display', 'clock'):
             self.view, self.info_at = action, 0
         elif action.startswith('tab-'):
             self.tab = action[4:]
         elif action in ('h+', 'h-'):
-            c.alarm['h'] = (c.alarm['h'] + (1 if action == 'h+' else -1)) % 24
+            a = c.alarms[self.edit]
+            a['h'] = (a['h'] + (1 if action == 'h+' else -1)) % 24
             c.save()
         elif action in ('m+', 'm-', 'm+10'):
-            c.alarm['m'] = (c.alarm['m'] + {'m+': 1, 'm-': -1, 'm+10': 10}[action]) % 60
+            a = c.alarms[self.edit]
+            a['m'] = (a['m'] + {'m+': 1, 'm-': -1, 'm+10': 10}[action]) % 60
             c.save()
         elif action == 'alarm-toggle':
-            c.alarm['on'] = not c.alarm['on']
+            a = c.alarms[self.edit]
+            a['on'] = not a['on']
             c.save()
-            self.say('alarm on: rings in %s' % c.until_alarm() if c.alarm['on'] else 'alarm off')
+            self.say('alarm on: rings in %s' % span(until(a)) if a['on'] else 'alarm off')
         elif action == 'alarm-repeat':
+            a = c.alarms[self.edit]
             modes = list(REPEATS)
-            c.alarm['repeat'] = modes[(modes.index(c.alarm['repeat']) + 1) % len(modes)]
+            a['repeat'] = modes[(modes.index(a['repeat']) + 1) % len(modes)]
             c.save()
         elif action == 'sw-toggle':
             if c.sw_start:
@@ -773,9 +1079,27 @@ class App:
         elif action == 't-reset':
             c.timer_end, c.timer_left = None, c.timer_set
         elif action in ('bl-', 'bl+'):
-            level = max(10, min(255, self.backlight() + (20 if action == 'bl+' else -20)))
-            self.backlight(level)
+            # The fixed level, or with automatic brightness the lit room's.
+            base = self.auto_range()[1] if self.auto_wanted() else self.backlight()
+            level = max(10, min(255, base + (20 if action == 'bl+' else -20)))
             self.set_setting('BACKLIGHT', level)
+            self.show_level(level)
+        elif action in ('dark-', 'dark+'):
+            lo, hi = self.auto_range()
+            step = 2 if lo < 20 or (lo == 20 and action == 'dark-') else 10
+            level = max(1, min(hi, lo + (step if action == 'dark+' else -step)))
+            self.set_setting('BACKLIGHT_DARK', level)
+            self.show_level(level)
+        elif action == 'auto-bl':
+            on = not self.auto_wanted()
+            if on and self.setting_int('BACKLIGHT', 90) == 0:
+                self.set_setting('BACKLIGHT', 90)
+            self.set_setting('AUTO_BRIGHTNESS', 1 if on else 0)
+            self.bl_goal = None
+            if not on:
+                self.backlight(self.setting_int('BACKLIGHT', 90))
+            self.say('auto brightness on: the screen follows the room\'s light' if on
+                     else 'auto brightness off: the screen stays at %d' % self.setting_int('BACKLIGHT', 90))
         elif action in ('vol-', 'vol+'):
             self.volume(10 if action == 'vol+' else -10)
         elif action == 'beep':
@@ -799,9 +1123,7 @@ class App:
             else:
                 self.confirm, self.confirm_until = action, time.time() + 4
         elif action == 'dark':
-            self.dark = True
-            self.saved_bl = self.backlight()
-            self.backlight(0)
+            self.go_dark(self.backlight())
 
     # The alarm's track, or a preview of it: one penguin-sound play at a time. SIGTERM stops it.
 
@@ -869,9 +1191,7 @@ class App:
         sx, sy = y, PANEL_SHORT - x
         col, row = min(COLS - 1, max(0, sx // CELL_W)), min(ROWS - 1, max(0, sy // CELL_H))
         if self.dark:
-            self.dark = False
-            self.backlight(getattr(self, 'saved_bl', 90))
-            self.scr.flush(force=True)
+            self.wake()
             return
         if os.environ.get('PENGUIN_UI_DEBUG'):
             with open('/run/penguin/ui-taps.log', 'a') as f:
@@ -933,10 +1253,13 @@ class App:
         fds = [fd for fd in (self.touch, self.keys) if fd is not None]
         while True:
             self.clocks.tick()
+            if self.clocks.reload_if_changed() and self.view in ('alarm', 'sound'):
+                self.view = 'clock'  # the alarm being edited may be gone or moved
+                self.say('the alarms were changed elsewhere')
+            self.follow_light()
             if self.clocks.ringing:
                 if self.dark:
-                    self.dark = False
-                    self.backlight(getattr(self, 'saved_bl', 90))
+                    self.wake()
                 if time.time() - self.clocks.ring_since > 600:
                     self.stop_ring()  # ten minutes is enough
                 else:

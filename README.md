@@ -4,7 +4,8 @@
 
 echo-penguin replaces Android on the Echo Show 5 2nd gen (codename `cronos`) with
 [Alpine Linux](https://alpinelinux.org/): you get Wi-Fi, SSH with keys only, Docker, a simple touch
-screen with a clock, alarm and system information, the speaker, and a system built to run 24/7
+screen with a clock, alarms and system information that dims itself when the room goes dark, the
+speaker, and a system built to run 24/7
 without anyone touching it. It is built on top of the
 [TECHO5](https://github.com/HuskerMinion/techo5) boot chain.
 
@@ -23,7 +24,7 @@ without anyone touching it. It is built on top of the
 - [What you get](#what-you-get)
 - [Goals and non-goals](#goals-and-non-goals)
 - [Quick start](#quick-start)
-- [Using the Echo](#using-the-echo) ([The alarm's music](#the-alarms-music), [Securing SSH](#securing-ssh))
+- [Using the Echo](#using-the-echo) ([Alarms](#alarms), [Automatic brightness](#automatic-brightness), [Securing SSH](#securing-ssh))
 - [How it works](#how-it-works)
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
@@ -43,7 +44,7 @@ without anyone touching it. It is built on top of the
 | **Containers** | Docker (overlay2, data on `/data/docker`) on the `docker` kernel |
 | **Reliability** | hardware watchdog, temperature guard, weekly restart, rotated logs, A/B system slots with automatic rollback |
 | **Security** | firewall closes everything on Wi-Fi except SSH and the ports you choose |
-| **Screen** | a touch interface (clock, alarm with a beep or your own music, stopwatch, timer, system, network & SSH, installed software, logs, brightness/volume); kernel and boot messages while it boots |
+| **Screen** | a touch interface (clock, up to eight alarms with a beep or your own music, stopwatch, timer, system, network & SSH, installed software, logs, brightness/volume); brightness that follows the room's light; kernel and boot messages while it boots |
 | **Sound** | the built-in speaker (`penguin-sound`: beeps, WAV and MP3), the volume buttons |
 
 Typical uses: a home lab node, a small self-hosted service, a Docker host for lightweight
@@ -176,7 +177,9 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 | `LAN_PORTS` | *(empty)* | extra TCP ports open on Wi-Fi, e.g. `"80 443"` |
 | `DOCKER_LAN` | `0` | `1` lets containers' published ports be reached from Wi-Fi |
 | `DOCKER` | `auto` | start Docker when the kernel supports it, or `off` |
-| `BACKLIGHT` | `90` | screen brightness 0–255 (`0` = off) |
+| `BACKLIGHT` | `90` | screen brightness 0–255 (`0` = off); with automatic brightness, the level in a lit room |
+| `AUTO_BRIGHTNESS` | `1` | the screen follows the room's light ([Automatic brightness](#automatic-brightness)); `0` = fixed at `BACKLIGHT` |
+| `BACKLIGHT_DARK` | `10` | with automatic brightness, the level in a dark room (1–255) |
 | `SCREEN_UI` | `1` | the touch interface; `0` = the screen shows the log console only |
 | `SCREEN_MIRROR` | `1` | show interactive SSH/USB sessions on the screen's log console |
 | `VOLUME` | `50` | speaker volume 0–100 |
@@ -185,10 +188,9 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 
 **The screen.** The home screen shows the time and six buttons: **Logs** (kernel errors, the boot
 log and every interactive SSH or USB-console session, live), **System**, **Network & SSH**,
-**Clock** (an alarm that repeats every day, on weekdays or weekends, or rings once, with a beep or
-[a track of yours](#the-alarms-music); a stopwatch; a timer), **Installed** and **Display & sound**
-(brightness, volume, screen off). `< Back` returns. The volume buttons on top change the volume, or
-stop a ringing alarm. The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on
+**Clock** ([alarms](#alarms); a stopwatch; a timer), **Installed** and **Display & sound**
+([brightness](#automatic-brightness), volume, screen off). `< Back` returns. The volume buttons on top
+change the volume, or stop a ringing alarm. The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on
 the kernel's framebuffer console, Python's standard library only.
 
 **Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav|file.mp3`,
@@ -196,21 +198,55 @@ the kernel's framebuffer console, Python's standard library only.
 it, the first sound panics the kernel), so use it rather than `aplay` directly. One sound plays at a
 time: another one asked for meanwhile is skipped. SIGTERM stops a playback cleanly.
 
-### The alarm's music
+### Alarms
 
-The alarm can play a track instead of the beep. Tracks live in `/data/penguin/music/`, so they
-survive system updates: `.mp3` and `.wav` files (the extension in any case), copied in over SSH:
+Clock > Alarm lists the alarms, up to eight, in time order. Tap `+ Add an alarm`, or an alarm to
+change it: its time, `Alarm is ON/OFF`, `Repeat:` (every day, Monday to Friday, Saturday and Sunday,
+or once, after which it turns itself off) and `Sound:`. `Delete` asks for a second tap. The `ON`/`off`
+box next to each alarm switches it without opening it. The home screen shows the next alarm due.
+Alarms that fall on the same minute ring once. A ringing alarm stops with a tap, the volume buttons,
+or by itself after ten minutes.
+
+The alarms are kept in `/data/penguin/alarms.json`, which the screen reloads by itself when it
+changes, so they can also be edited from a PC (the [Echo Manager](https://github.com/matheusinfo/echo-penguin-manager) desktop app does). Up to
+v0.2.8 there was a single alarm, in `alarm.json`: it becomes the first alarm of the list, and the old
+file is left alone, so a rollback to an older slot still finds its alarm.
+
+**Music.** An alarm can play a track instead of the beep. Tracks live in `/data/penguin/music/`, so
+they survive system updates: `.mp3` and `.wav` files (the extension in any case), copied in over SSH:
 
 ```bash
 ssh root@<ip> mkdir -p /data/penguin/music
 scp 'My song.mp3' root@<ip>:/data/penguin/music/
 ```
 
-On the screen, Clock > Alarm > `Sound:` lists the built-in beep and every track in the folder (ten per page;
-new files show up without a restart). Tap one to choose it; `Play the chosen sound` previews it and
+An alarm's `Sound:` button lists the built-in beep and every track in the folder (ten per page; new
+files show up without a restart). Tap one to choose it; `Play the chosen sound` previews it and
 `Stop` ends the preview. When the alarm rings, the track plays from the start, over and over, until
-you stop it or for ten minutes at most, and the screen shows its name. If the track cannot play (the
-file is gone or broken), the alarm beeps instead: it never stays silent. The timer always beeps.
+you stop it, and the screen shows its name. If the track cannot play (the file is gone or broken),
+the alarm beeps instead: it never stays silent. The timer always beeps.
+
+### Automatic brightness
+
+With `AUTO_BRIGHTNESS=1` (the default), the screen follows the room's light: when the room goes
+dark, it fades down to `BACKLIGHT_DARK` within a few seconds, and back up to `BACKLIGHT` when the
+light comes back on. It reads the Echo's ambient light sensor once a second; a hand passing in front
+of it changes nothing, and small changes in the room leave the level alone.
+
+Display & sound shows the sensor's reading (`room light`, 0–4095) and sets both levels: with
+automatic brightness on, the top `-`/`+` set the lit room's level and the second pair the dark
+room's (each shown for a few seconds as you change it). `Auto brightness: ON/OFF` switches it. The
+readings that count as dark and as lit are two more settings, `LIGHT_DARK` (default 3) and
+`LIGHT_BRIGHT` (default 80); in between, the level moves along a log scale. If the screen stays too
+bright with the lights off, look at the reading on that screen in the dark and set `LIGHT_DARK` a
+little above it:
+
+```bash
+penguin set LIGHT_DARK 8        # the screen picks it up within seconds
+```
+
+`Screen off`, or a backlight set to 0 from SSH or Echo Manager, keeps the screen dark until a tap
+or a ringing alarm brings it back.
 
 ### Securing SSH
 
@@ -301,7 +337,7 @@ eMMC (mmcblk0)
 │       ├── a/               a complete root filesystem   (a.state: good | trial N | bad)
 │       └── b/               the other one: where the next update goes
 └── userdata (p16) /data: everything that must survive updates
-    ├── penguin/             settings.conf, alarm.json, logs/, music/ (the alarm's tracks)
+    ├── penguin/             settings.conf, alarms.json, logs/, music/ (the alarms' tracks)
     ├── docker/              images, containers, volumes
     ├── techo5-linux/        boot logs, crash records, SSH host key, Wi-Fi credentials
     └── misc/techo5/ssh/     authorized_keys
@@ -390,7 +426,8 @@ flowchart TB
     INITD[busybox init] -->|sysinit| BOOT[boot.sh]
     INITD -->|respawn| RUN[techo5-run]
     INITD -->|respawn, tty1| UI[penguin-ui · touch screen]
-    UI -->|alarm, test| SND[penguin-sound · speaker]
+    UI -->|alarms, test| SND[penguin-sound · speaker]
+    ALS[light sensor] -->|automatic brightness| UI
     RUN --> SUP[supervisor · techo5]
     SUP -->|starts, restarts| DD[dockerd → containers]
     SUP -->|above TEMP_CRIT| PAUSE[pause containers]
@@ -524,7 +561,7 @@ work/out/     the finished boot images, kernels and rootfs tarballs
 
 ## Status and next steps
 
-**Current version: v0.2.7** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+**Current version: v0.2.8** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
 the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
 power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
 SSH controls.
@@ -547,13 +584,12 @@ SSH controls.
 2. **One-command updates from the PC.** Today it is the three commands under
    [Updating the system](#updating-the-system). Next: a `scripts/update.sh` that builds, copies,
    runs `slotctl install`, reboots, waits for the slot to commit and runs `verify.sh`.
-3. **Night mode / automatic brightness.** The light sensor (`m_alsps_input`) is unused, and the
-   panel stays at `BACKLIGHT` around the clock. Next: brightness that follows the room's light,
-   and/or a dim or dark schedule at night that still wakes for the alarm.
-4. **Backup and restore of `/data`.** Next: a `scripts/backup.sh` / `restore.sh` for the keys,
-   settings, the alarm and containers' volumes.
-5. **The mute button.** `gpio-privacy-button` does nothing yet. Next: screen off/on, or stop the
-   alarm.
+3. **Backup and restore of `/data`.** Next: a `scripts/backup.sh` / `restore.sh` for the keys,
+   settings, the alarms and containers' volumes.
+4. **The mute button.** `gpio-privacy-button` does nothing yet. Next: screen off/on, or stop a
+   ringing alarm.
+5. **A night schedule.** [Automatic brightness](#automatic-brightness) follows the room's light.
+   Next, maybe: the screen fully off at set hours, still waking for an alarm.
 6. **The rescue environment's SSH.** It comes from TECHO5's initramfs and only runs after a failed
    boot, but it has no firewall and ignores `SSH_ALLOW`. Next: a build-time fix in `scripts/lib.sh`,
    like the existing NTP one.

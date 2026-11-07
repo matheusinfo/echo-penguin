@@ -6,6 +6,27 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 
 ## Unreleased
 
+Several alarms, and a screen that dims itself when the room goes dark.
+
+- Up to eight alarms. Clock > Alarm lists them in time order, each with an `ON`/`off` switch; tap
+  one to change its time, repeat, sound, or to delete it (two taps); `+ Add an alarm` adds one. The
+  home screen shows the next alarm due. Alarms due at the same minute ring once, with a track if
+  one of them has one.
+- The alarms live in `/data/penguin/alarms.json` (`{"alarms": [...]}`), reloaded by the screen
+  whenever the file changes: Echo Manager (or anything else) can edit them without restarting
+  `penguin-ui`. The single alarm of `alarm.json` becomes the first of the list; that file is left in
+  place, so a rollback to an older slot keeps its alarm.
+- Automatic brightness (`AUTO_BRIGHTNESS=1`, on by default): the screen follows the room's light
+  sensor, fading between `BACKLIGHT_DARK` (default 10) in the dark and `BACKLIGHT` in a lit room.
+  `LIGHT_DARK` / `LIGHT_BRIGHT` (defaults 3 and 80) are the sensor readings taken as dark and lit.
+  Display & sound shows the reading and sets both levels.
+- The light sensor is a JSA1214 behind the vendor `als_ps` driver (named after stk3x1x). The driver
+  can leave its measurement off, which freezes the count; `penguin-ui` turns it on (register 0x01 =
+  0x04: light on, proximity off) at start and again after ten minutes without the slightest change.
+- A screen turned off from outside (backlight 0 over SSH or from Echo Manager) is now treated as
+  `Screen off`: a tap or a ringing alarm wakes it. Turned back on from outside, the interface shows
+  again.
+
 ## v0.2.8 — 2026-11-02
 
 The alarm plays your music, and the big digits are no longer drawn torn.

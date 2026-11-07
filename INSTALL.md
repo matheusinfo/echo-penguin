@@ -161,9 +161,10 @@ at the end of `verify.sh`'s output.
 
 - **The screen:** tap the buttons. **Logs** shows kernel errors, the boot log and every SSH or USB
   console session as it happens. **System** shows CPU, RAM and storage. **Network & SSH** shows the
-  address, Wi-Fi and the authorized keys. **Clock** has an alarm, a stopwatch and a timer.
-  **Installed** lists Docker and the main packages. **Display & sound** sets brightness and volume,
-  and can turn the screen off (a tap brings it back). The volume buttons on top work too.
+  address, Wi-Fi and the authorized keys. **Clock** has up to eight alarms, a stopwatch and a
+  timer. **Installed** lists Docker and the main packages. **Display & sound** sets brightness
+  (which follows the room's light by default) and volume, and can turn the screen off (a tap brings
+  it back). The volume buttons on top work too.
 - **SSH:** `ssh -i ~/.ssh/techo5 root@<echo-ip>`, then `penguin status`, `penguin settings`,
   `penguin set KEY VALUE`. The full list is in the [README](README.md#using-the-echo).
 - **Sound:** `penguin-sound beep`, `penguin-sound play file.wav`, `penguin-sound volume 60`.
