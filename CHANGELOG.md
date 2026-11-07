@@ -6,6 +6,8 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 
 ## Unreleased
 
+## v0.2.9 — 2026-11-07
+
 Several alarms, and a screen that dims itself when the room goes dark.
 
 - Up to eight alarms. Clock > Alarm lists them in time order, each with an `ON`/`off` switch; tap

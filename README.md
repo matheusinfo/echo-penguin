@@ -561,7 +561,7 @@ work/out/     the finished boot images, kernels and rootfs tarballs
 
 ## Status and next steps
 
-**Current version: v0.2.8** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+**Current version: v0.2.9** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
 the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
 power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
 SSH controls.
