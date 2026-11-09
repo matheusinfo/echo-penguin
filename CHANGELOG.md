@@ -6,6 +6,41 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 
 ## Unreleased
 
+## v0.3.0 — 2026-11-09
+
+A gentler alarm, the weather, a night clock and a sleep diary.
+
+- Gradual wake. `WAKE_LIGHT` minutes before an alarm (default 10) an untouched screen shows a sunrise:
+  colours from deep red to warm white through the console's palette (`ESC ] P`, verified on the
+  MediaTek framebuffer), the backlight climbing from `BACKLIGHT_DARK` to `BACKLIGHT`, even from
+  `Screen off`. The alarm's volume climbs from `WAKE_VOLUME_START` percent of `VOLUME` (80: 40 with the
+  default `VOLUME=50`) to `VOLUME` over `WAKE_RAMP` seconds (60); the TAS5805M's control is 1 dB a
+  step, about 1.6 dB a percent of the volume scale.
+- Weather: `penguin-weather` (Open-Meteo, no account) fetches the forecast for `WEATHER_LAT` /
+  `WEATHER_LON` every 30 minutes into `/run/penguin/weather.json`; the home screen shows a line under
+  the clock. `penguin-weather set CITY` chooses the place by name.
+- Speech: `penguin-sound say TEXT` (espeak-ng, a new package of about 19 MB; voice `SPEAK_VOICE`).
+  After an alarm is stopped (`SPEAK_ALARM=1`), and when the home screen's clock is tapped, the time
+  and the weather are said in the voice's language (English or Portuguese).
+- Night clock: left alone for 30 s in a dark room, the screen shows only a dim red (or amber) clock
+  and the next alarm (`NIGHT_CLOCK=auto|on|off`, `NIGHT_COLOR=red|amber`).
+- Sleep diary: the screen records the room going dark and lit again (steady for 2 minutes) and the
+  alarms' rings and stops in `/data/penguin/sleep-log.jsonl` (`SLEEP_LOG=1`).
+  `penguin-sleep` computes the nights (lights off to the alarm stopped, or to the lights on in the
+  morning), and Clock > Sleep shows the last seven with their average and the light reading next to
+  `LIGHT_DARK`.
+- Clock has a fourth tab, Sleep. The home screen fits the weather in by making its six buttons a
+  row shorter; the big clock keeps its blank row under the top bar.
+- `penguin-sound` never lets ALSA's plug layer convert audio any more. The first speech test played
+  espeak-ng's 22050 Hz mono WAV through `plughw:0,23`: it underran on every period, and a page of an
+  unrelated file (`penguin-sound` itself) turned to zeros in the page cache, most likely written by
+  the AFE driver (the file on disk was intact after a reboot). Speech is now converted to 48 kHz
+  stereo in Python and played like the beeps; MP3 was already decoded to that format; a WAV track in
+  any other format is refused, so its alarm beeps instead (convert it, or use MP3).
+- `penguin set` refuses a value with `"`, `$`, a backquote, a backslash or a control character, and
+  a malformed name: `settings.conf` is sourced by the shell as root at boot, so such a value could
+  have run as code.
+
 ## v0.2.9 — 2026-11-07
 
 Several alarms, and a screen that dims itself when the room goes dark.
