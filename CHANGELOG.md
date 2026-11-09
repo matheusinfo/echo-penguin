@@ -6,6 +6,29 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 
 ## Unreleased
 
+## v0.3.1 — 2026-11-09
+
+A natural voice for the alarm's greeting.
+
+- Piper, an offline neural voice, in Brazilian Portuguese (`pt_BR-faber-medium`). With
+  `SPEAK_ENGINE=piper` the greeting after an alarm is Piper's: it needs about 40 s for a sentence on
+  this CPU (18 s of it loading the model), so `penguin-ui` renders it in the background (niced) ten
+  minutes before the alarm, saying when the alarm rang, and plays it when the alarm is stopped. Not
+  ready in time (an alarm set a minute ahead), it is waited for up to a minute, then espeak-ng says
+  the time instead. A tap on the home clock stays espeak-ng (instant). `PIPER_VOICE` chooses the
+  voice, from `/usr/share/piper/voices` or `/data/penguin/voices`.
+- Piper is only in Alpine's edge/testing, against libraries newer than v3.24's. `scripts/build-piper.sh`
+  (run by `build-rootfs.sh`; `PIPER=0` leaves it out) installs it from edge into a scratch root, copies
+  `piper_exe`, the 55 libraries it loads and edge's musl loader into `/usr/lib/piper`, and runs it
+  through that loader (`/usr/local/bin/piper`), apart from the system's libraries. Versions and the
+  voice's SHA-256 are pinned in `config.env`. Tested on the unit first in an armv7 container, then
+  natively: 38 s for a sentence, the same. A 64-bit build was faster (26 s) but not enough to change
+  the design, and would need Docker's seccomp filter off.
+- `penguin-sound say|render -e espeak|piper [-v VOICE]`: `render` writes the WAV without playing it.
+  Piper's 32-bit float WAV is read and converted to the speaker's 48 kHz stereo like espeak-ng's.
+- `penguin-weather speech -e ENGINE -v VOICE --alarm HH:MM`: the language follows the voice that will
+  speak (Piper's voice with `SPEAK_ENGINE=piper`), and `--alarm` says when the alarm rang.
+
 ## v0.3.0 — 2026-11-09
 
 A gentler alarm, the weather, a night clock and a sleep diary.
