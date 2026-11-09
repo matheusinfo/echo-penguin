@@ -285,7 +285,13 @@ settings) (set -a; . /etc/penguin/defaults.conf; [ -r $PENGUIN_DATA/settings.con
 	sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' /etc/penguin/defaults.conf | while read -r k; do eval "echo $k=\"\$$k\""; done);;
 set)
 	[ -n "${2:-}" ] && [ $# -ge 3 ] || { echo "usage: penguin set KEY VALUE" >&2; exit 2; }
+	case "$2" in *[!A-Z0-9_]*|[!A-Z_]*) echo "invalid setting name $2" >&2; exit 2;; esac
 	grep -q "^$2=" /etc/penguin/defaults.conf || { echo "unknown setting $2 (see penguin settings)" >&2; exit 2; }
+	# settings.conf is sourced by the shell as root at boot, each value inside double quotes: a
+	# quote, $, a backquote or a backslash in a value would run as code there. Control characters
+	# (a newline would start another setting) are refused too.
+	case "$3" in *[\"\$\`\\]*) echo "a setting's value cannot contain \" \$ \` or \\" >&2; exit 2;; esac
+	[ "$(printf '%s' "$3" | tr -d '[:cntrl:]')" = "$3" ] || { echo "a setting's value cannot contain control characters" >&2; exit 2; }
 	set_setting "$2" "$3"
 	echo "$2=$3 (takes effect after: penguin restart; firewall settings: penguin firewall)"
 	;;
