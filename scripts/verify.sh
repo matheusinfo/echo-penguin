@@ -53,7 +53,11 @@ eval "$(on '. /lib/penguin.sh; p_settings
 	echo "ui=$(ps | grep -c "[p]enguin-ui")"
 	echo "touch=$(grep -c "^N: Name=\"goodix-ts\"" /proc/bus/input/devices)"
 	echo "fbcon=$(grep -c "frame buffer" /sys/class/vtconsole/vtcon*/name 2>/dev/null | grep -c ":1")"
-	echo "vol=$(/usr/local/sbin/penguin-sound volume 2>/dev/null)"')"
+	echo "vol=$(/usr/local/sbin/penguin-sound volume 2>/dev/null)"
+	echo "espeak=$(command -v espeak-ng >/dev/null && echo 1 || echo 0)"
+	echo "sleepd=$(/usr/local/sbin/penguin-sleep nights --json >/dev/null 2>&1 && echo 1 || echo 0)"
+	echo "wxplace=\"$WEATHER_PLACE\" wxlat=\"$WEATHER_LAT\""
+	echo "wxline=\"$(/usr/local/sbin/penguin-weather line 2>/dev/null | tr -d "\"\\$\`")\""')"
 
 note "release: $rel"
 note "kernel: $kern, docker: ${docker:-?}, slot ${slot:-none} ($slotstate)"
@@ -77,6 +81,11 @@ if [ "${SCREEN_UI_EXPECTED:-1}" = 1 ]; then
 fi
 [ "${touch:-0}" = 1 ] && pass "touchscreen present (goodix-ts)" || fail "no goodix-ts input device"
 case "$vol" in [0-9]*) pass "speaker volume control: $vol %";; *) fail "no speaker volume control (penguin-sound volume)";; esac
+[ "${espeak:-0}" = 1 ] && pass "speech (espeak-ng)" || warn "espeak-ng missing: no speech after an alarm"
+[ "${sleepd:-0}" = 1 ] && pass "sleep diary readable (penguin-sleep)" || warn "penguin-sleep nights failed"
+if [ -n "$wxlat" ]; then
+	[ -n "$wxline" ] && pass "weather for ${wxplace:-$wxlat}: $wxline" || warn "weather set (${wxplace:-$wxlat}) but no recent forecast (penguin-weather show)"
+fi
 [ "${avail:-0}" -ge 150 ] && pass "memory available: ${avail} MB" || fail "memory available: ${avail} MB (< 150)"
 [ "$zram" = 1 ] && pass "zram swap active" || warn "no zram swap"
 [ "$wd" = 1 ] && pass "watchdog fed" || warn "watchdog not running"

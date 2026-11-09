@@ -1,0 +1,476 @@
+#!/usr/bin/python3
+"""penguin-weather — the weather, for the home screen and the spoken greeting after an alarm.
+
+    penguin-weather update            fetch it now into /run/penguin/weather.json (WEATHER_LAT, WEATHER_LON)
+    penguin-weather line              one line for the home screen; nothing without recent data
+    penguin-weather speech [-v VOICE] the spoken greeting: the time, then the weather (SPEAK_VOICE's language)
+    penguin-weather find CITY         places by that name, one per line: LAT LON NAME, REGION, COUNTRY
+    penguin-weather set CITY          make the first of them the location (penguin set), then update
+    penguin-weather show [--json]     what the cache holds (--json: the cache itself, or null)
+
+The forecast comes from Open-Meteo (open-meteo.com: no key, data under CC BY 4.0), over HTTPS with the
+standard library; the place search is its geocoding API. CITY may carry a region or country after a
+comma ("Springfield, Illinois", "Paris, FR"), which narrows the matches.
+
+update exits 0 when the cache was refreshed, 1 on an error (also kept in the cache's "error", beside
+the last good data), 2 when no location is configured (the cache is then removed). penguin-ui runs it
+in the background every 30 minutes and shows `line`. The cache, written atomically:
+
+    {"fetched": EPOCH, "place": STR, "lat": FLOAT, "lon": FLOAT,
+     "now": {"temp": FLOAT, "code": WMO_CODE, "text": "partly cloudy"},
+     "today": {"max": FLOAT, "min": FLOAT, "rain_prob": PERCENT, "rain_from": "15:00" | null},
+     "error": null | STR,
+     "tried": EPOCH, "date": "YYYY-MM-DD", "utc_offset": SECONDS, "rain_hours": [24 x PERCENT | null]}
+
+"today" covers the rest of the place's day from the hour of the fetch: rain_prob is the highest chance
+of rain left, rain_from the first hour with at least 50 %. date, utc_offset (the place's own day and
+clock) and rain_hours (today's chance of rain hour by hour) let `line` and `speech` count from the
+current hour instead, and drop "today" once the place's day has changed. Data older than 3 hours is
+neither shown nor spoken. Temperatures are degrees Celsius.
+
+PENGUIN_RUN (the cache's directory), PENGUIN_SETTINGS (the settings files, colon-separated) and
+PENGUIN_BIN (the penguin command) override the paths, for tests off the unit.
+"""
+import http.client
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+RUN = os.environ.get('PENGUIN_RUN', '/run/penguin')
+CACHE = os.path.join(RUN, 'weather.json')
+SETTINGS = tuple(os.environ.get('PENGUIN_SETTINGS', '/etc/penguin/defaults.conf:/data/penguin/settings.conf')
+                 .split(':'))
+PENGUIN = os.environ.get('PENGUIN_BIN', '/usr/local/sbin/penguin')
+FORECAST = 'https://api.open-meteo.com/v1/forecast'
+GEOCODING = 'https://geocoding-api.open-meteo.com/v1/search'
+TIMEOUT = 15          # s, for each request
+FRESH = 3 * 3600      # s: older data is neither shown nor spoken
+RAIN_LIKELY = 50      # %: an hour with at least this chance of rain makes rain "likely"
+RAIN_MENTION = 20     # %: below this, rain is not mentioned
+LINE_MAX = 76
+
+# WMO weather codes (the ones Open-Meteo reports): short English for the screen, Portuguese for speech.
+WMO = {
+    0: ('clear sky', 'céu limpo'),
+    1: ('mainly clear', 'céu quase limpo'),
+    2: ('partly cloudy', 'parcialmente nublado'),
+    3: ('overcast', 'nublado'),
+    45: ('fog', 'neblina'),
+    48: ('freezing fog', 'neblina com geada'),
+    51: ('light drizzle', 'garoa fraca'),
+    53: ('drizzle', 'garoa'),
+    55: ('heavy drizzle', 'garoa forte'),
+    56: ('freezing drizzle', 'garoa congelante'),
+    57: ('heavy freezing drizzle', 'garoa congelante forte'),
+    61: ('light rain', 'chuva fraca'),
+    63: ('rain', 'chuva'),
+    65: ('heavy rain', 'chuva forte'),
+    66: ('freezing rain', 'chuva congelante'),
+    67: ('heavy freezing rain', 'chuva congelante forte'),
+    71: ('light snow', 'neve fraca'),
+    73: ('snow', 'neve'),
+    75: ('heavy snow', 'neve forte'),
+    77: ('snow grains', 'grãos de neve'),
+    80: ('light showers', 'pancadas de chuva fracas'),
+    81: ('showers', 'pancadas de chuva'),
+    82: ('violent showers', 'pancadas de chuva fortes'),
+    85: ('snow showers', 'pancadas de neve'),
+    86: ('heavy snow showers', 'pancadas de neve fortes'),
+    95: ('thunderstorm', 'trovoada'),
+    96: ('thunderstorm, hail', 'trovoada com granizo'),
+    99: ('thunderstorm, heavy hail', 'trovoada com granizo forte'),
+}
+# Hours are feminine in Portuguese ("duas horas"); espeak-ng would read the digits as masculine.
+HOURS_PT = {1: 'uma', 2: 'duas', 21: 'vinte e uma', 22: 'vinte e duas'}
+
+
+def read(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def settings():
+    values = {}
+    for path in SETTINGS:
+        for line in read(path).splitlines():
+            m = re.match(r'^([A-Z_][A-Z0-9_]*)=("?)(.*?)\2\s*(#.*)?$', line)
+            if m:
+                values[m.group(1)] = m.group(3)
+    return values
+
+
+def location(s):
+    """(lat, lon, place) from the settings; None when WEATHER_LAT and WEATHER_LON are both empty."""
+    lat, lon = s.get('WEATHER_LAT', '').strip(), s.get('WEATHER_LON', '').strip()
+    if not lat and not lon:
+        return None
+    try:
+        lat, lon = float(lat), float(lon)
+    except ValueError:
+        lat = lon = math.nan
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError('WEATHER_LAT and WEATHER_LON must be decimal degrees (e.g. -23.5475 and -46.6361)')
+    return lat, lon, s.get('WEATHER_PLACE', '')
+
+
+def get_json(url, params):
+    host = urllib.parse.urlsplit(url).hostname
+    req = urllib.request.Request(url + '?' + urllib.parse.urlencode(params), headers={'User-Agent': 'echo-penguin'})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            reason = json.load(e).get('reason')
+        except (OSError, ValueError, AttributeError, http.client.HTTPException):
+            reason = None
+        raise RuntimeError('%s: HTTP %d%s' % (host, e.code, ': %s' % reason if reason else ''))
+    except urllib.error.URLError as e:
+        raise RuntimeError('%s: %s' % (host, e.reason))
+    except (OSError, ValueError, http.client.HTTPException) as e:  # timeouts, a cut connection, bad JSON
+        raise RuntimeError('%s: %s' % (host, e or type(e).__name__))
+
+
+def describe(code, pt=False):
+    names = WMO.get(code)
+    return names[1 if pt else 0] if names else ''
+
+
+def rain(hours, from_hour):
+    """(highest chance, first hour with rain likely as "HH:00" or None) from from_hour to the day's end."""
+    rest = [(h, p) for h, p in enumerate(hours) if h >= from_hour and p is not None]
+    return (max((p for _, p in rest), default=0),
+            next(('%02d:00' % h for h, p in rest if p >= RAIN_LIKELY), None))
+
+
+def fetch(lat, lon):
+    """The cache's weather fields, fresh from Open-Meteo."""
+    d = get_json(FORECAST, {
+        'latitude': lat, 'longitude': lon,
+        'current': 'temperature_2m,weather_code',
+        'daily': 'temperature_2m_max,temperature_2m_min',
+        'hourly': 'precipitation_probability',
+        'timezone': 'auto', 'forecast_days': 1})
+    try:
+        cur, daily, hourly = d['current'], d['daily'], d['hourly']
+        stamp = cur['time']                      # the place's local time, "YYYY-MM-DDTHH:MM"
+        date, hour = stamp[:10], int(stamp[11:13])
+        hours = [None] * 24
+        for t, p in zip(hourly['time'], hourly['precipitation_probability']):
+            if t[:10] == date and p is not None:
+                hours[int(t[11:13])] = int(round(p))
+        i = daily['time'].index(date)
+        code = int(cur['weather_code'])
+        rain_prob, rain_from = rain(hours, hour)
+        return {
+            'now': {'temp': float(cur['temperature_2m']), 'code': code, 'text': describe(code)},
+            'today': {'max': float(daily['temperature_2m_max'][i]), 'min': float(daily['temperature_2m_min'][i]),
+                      'rain_prob': rain_prob, 'rain_from': rain_from},
+            'date': date, 'utc_offset': int(d.get('utc_offset_seconds') or 0), 'rain_hours': hours,
+        }
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as e:
+        raise RuntimeError('unexpected answer from Open-Meteo (%s: %s)' % (type(e).__name__, e))
+
+
+def load():
+    try:
+        with open(CACHE, encoding='utf-8') as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return cache if isinstance(cache, dict) else None
+
+
+ORDER = ('fetched', 'place', 'lat', 'lon', 'now', 'today', 'error', 'tried', 'date', 'utc_offset', 'rain_hours')
+
+
+def save(cache):
+    cache = dict(sorted(cache.items(), key=lambda kv: ORDER.index(kv[0]) if kv[0] in ORDER else len(ORDER)))
+    os.makedirs(RUN, exist_ok=True)
+    tmp = '%s.%d.tmp' % (CACHE, os.getpid())  # penguin-ui and `set` may update at the same moment
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False)
+            f.write('\n')
+        os.replace(tmp, CACHE)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def update():
+    try:
+        loc = location(settings())
+    except ValueError as e:
+        save({'fetched': None, 'place': '', 'lat': None, 'lon': None, 'now': None, 'today': None,
+              'error': str(e), 'tried': int(time.time())})
+        raise RuntimeError(str(e))
+    if loc is None:
+        try:
+            os.remove(CACHE)
+        except FileNotFoundError:
+            pass
+        print('penguin-weather: no location (WEATHER_LAT, WEATHER_LON): penguin-weather set CITY', file=sys.stderr)
+        return 2
+    lat, lon, place = loc
+    old = load()
+    if old and old.get('lat') == lat and old.get('lon') == lon:
+        cache = old                              # the last good data stays if this fetch fails
+    else:
+        cache = {'fetched': None, 'now': None, 'today': None}
+    cache.update(place=place, lat=lat, lon=lon, tried=int(time.time()))
+    try:
+        cache.update(fetch(lat, lon))
+    except RuntimeError as e:
+        cache['error'] = str(e)
+        save(cache)
+        raise
+    cache.update(fetched=int(time.time()), error=None)
+    save(cache)
+    return 0
+
+
+def current(now=None):
+    """The cache's weather when it is recent and for the configured place, else None. Its "today" is
+    recounted from the place's current hour, and dropped once the place's day has changed."""
+    try:
+        w = recent(time.time() if now is None else now)
+        if w:  # the renderers' fields, checked here so that a damaged cache shows nothing instead
+            whole(w['now']['temp'])
+            if w['today']:
+                whole(w['today']['min']), whole(w['today']['max']), int(w['today']['rain_prob'])
+        return w
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+        return None
+
+
+def recent(now):
+    try:
+        loc = location(settings())
+    except ValueError:
+        loc = None
+    cache = load()
+    if not loc or not cache or not cache.get('fetched') or not isinstance(cache.get('now'), dict):
+        return None
+    if (cache.get('lat'), cache.get('lon')) != loc[:2] or not -60 <= now - cache['fetched'] <= FRESH:
+        return None
+    w = {'now': cache['now'], 'today': None}
+    here = time.gmtime(now + (cache.get('utc_offset') or 0))  # the place's clock
+    today = cache.get('today')
+    if isinstance(today, dict) and cache.get('date', time.strftime('%Y-%m-%d', here)) == \
+            time.strftime('%Y-%m-%d', here):
+        w['today'] = dict(today)
+        hours = cache.get('rain_hours')
+        if isinstance(hours, list) and len(hours) == 24:
+            w['today']['rain_prob'], w['today']['rain_from'] = rain(hours, here.tm_hour)
+        w['today']['rain_now'] = (w['today']['rain_from'] or '99') <= '%02d:00' % here.tm_hour
+    return w
+
+
+def whole(x):
+    return int(math.floor(x + 0.5))  # 2.5 -> 3, not round()'s 2
+
+
+def line(w):
+    if not w:
+        return ''
+    n, t = w['now'], w['today']
+    parts = [('%d° %s' % (whole(n['temp']), n.get('text') or describe(n.get('code')))).strip()]
+    if t:
+        parts.append('%d°/%d°' % (whole(t['min']), whole(t['max'])))
+        if t['rain_now']:
+            parts.append('rain likely now')
+        elif t['rain_from']:
+            parts.append('rain likely from %sh' % t['rain_from'][:2])
+        elif t['rain_prob'] >= RAIN_MENTION:
+            parts.append('rain %d%%' % t['rain_prob'])
+    return ' · '.join(parts)[:LINE_MAX]
+
+
+def degrees(x, pt):
+    n = whole(x)
+    word = ('grau' if pt else 'degree') + ('' if abs(n) == 1 else 's')
+    return '%s%d %s' % (('menos ' if pt else 'minus ') if n < 0 else '', abs(n), word)
+
+
+def greeting(hour, pt):
+    if 4 <= hour < 12:
+        return 'Bom dia.' if pt else 'Good morning.'
+    if 12 <= hour < 18:
+        return 'Boa tarde.' if pt else 'Good afternoon.'
+    return 'Boa noite.' if pt else 'Good evening.'
+
+
+def clock_pt(hour, minute):
+    if hour in (0, 12):
+        said, verb = ('meia-noite' if hour == 0 else 'meio-dia'), 'É'
+    elif minute == 0:
+        said = '%s hora%s' % (HOURS_PT.get(hour, hour), '' if hour == 1 else 's')
+        verb = 'É' if hour == 1 else 'São'
+    else:
+        said, verb = HOURS_PT.get(hour, str(hour)), 'É' if hour == 1 else 'São'
+    return '%s %s%s.' % (verb, said, ' e %d' % minute if minute else '')
+
+
+def clock_en(hour, minute):
+    if minute == 0:
+        return 'It is %s.' % {0: 'midnight', 12: 'noon'}.get(hour, "%d o'clock" % (hour % 12))
+    return 'It is %d %s%d.' % (hour % 12 or 12, 'oh ' if minute < 10 else '', minute)
+
+
+def at_hour_pt(hour):
+    if hour == 0:
+        return 'da meia-noite'
+    if hour == 12:
+        return 'do meio-dia'
+    return 'da uma hora' if hour == 1 else 'das %s horas' % HOURS_PT.get(hour, hour)
+
+
+def at_hour_en(hour):
+    return {0: 'midnight', 12: 'noon'}.get(hour, '%d %s' % (hour % 12, 'AM' if hour < 12 else 'PM'))
+
+
+def speech(w, voice, now=None):
+    pt = voice.lower().startswith('pt')
+    lt = time.localtime(time.time() if now is None else now)
+    said = [greeting(lt.tm_hour, pt), clock_pt(lt.tm_hour, lt.tm_min) if pt else clock_en(lt.tm_hour, lt.tm_min)]
+    if w:
+        n, t = w['now'], w['today']
+        text = describe(n.get('code'), pt)
+        if pt:
+            said.append('Agora faz %s%s.' % (degrees(n['temp'], True), ', ' + text if text else ''))
+        else:
+            said.append('Right now it is %s%s.' % (degrees(n['temp'], False), ', ' + text if text else ''))
+        if t:
+            said.append(('Máxima de %s.' if pt else 'High of %s.') % degrees(t['max'], pt))
+            if t['rain_now']:
+                said.append('Chuva provável agora.' if pt else 'Rain likely now.')
+            elif t['rain_from']:
+                h = int(t['rain_from'][:2])
+                said.append('Chuva provável a partir %s.' % at_hour_pt(h) if pt else
+                            'Rain likely from %s.' % at_hour_en(h))
+            elif t['rain_prob'] >= RAIN_MENTION:
+                said.append(('Chance de chuva de %d por cento.' if pt else '%d percent chance of rain.') %
+                            t['rain_prob'])
+    return ' '.join(said)
+
+
+def fold(s):
+    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c)).casefold().strip()
+
+
+def clean(s):
+    """A place name as a setting: settings.conf is sourced by the shell, inside double quotes."""
+    return re.sub(r'[\s\x00-\x1f\x7f]+', ' ', re.sub(r'["`$\\]', '', s)).strip()
+
+
+def candidates(query):
+    """[(lat, lon, label)] for a place name, best first; text after a comma narrows them."""
+    name, _, rest = query.partition(',')
+    if not name.strip():
+        raise RuntimeError('no place name given')
+    d = get_json(GEOCODING, {'name': name.strip(), 'count': 10, 'language': 'en', 'format': 'json'})
+    found = []
+    for r in (d.get('results') if isinstance(d, dict) else None) or []:
+        try:
+            lat, lon = round(float(r['latitude']), 4), round(float(r['longitude']), 4)
+        except (KeyError, TypeError, ValueError):
+            continue
+        parts = [r.get('name') or '']
+        if r.get('admin1') and r['admin1'] != parts[0]:
+            parts.append(r['admin1'])
+        parts.append(r.get('country') or r.get('country_code') or '')
+        hay = [fold(str(r.get(k) or '')) for k in ('admin1', 'admin2', 'admin3', 'country', 'country_code')]
+        found.append((lat, lon, clean(', '.join(p for p in parts if p)), hay))
+    wanted = [fold(f) for f in rest.split(',') if f.strip()]
+    narrowed = [c for c in found if all(any(f == h or (len(f) > 2 and f in h) for h in c[3]) for f in wanted)]
+    return [c[:3] for c in (narrowed or found)]
+
+
+def set_city(query):
+    found = candidates(query)
+    if not found:
+        raise RuntimeError('no place called "%s"' % query)
+    lat, lon, label = found[0]
+    for key, value in (('WEATHER_LAT', '%.4f' % lat), ('WEATHER_LON', '%.4f' % lon), ('WEATHER_PLACE', label)):
+        r = subprocess.run([PENGUIN, 'set', key, value], capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            why = (r.stderr or r.stdout).strip() or 'exit %d' % r.returncode
+            raise RuntimeError('penguin set %s: %s' % (key, why))
+    print('%.4f %.4f %s' % (lat, lon, label))
+    return update()
+
+
+def show():
+    cache = load()
+    if not cache:
+        print('no weather data (%s)' % ('penguin-weather update' if location(settings()) else
+                                        'no location: penguin-weather set CITY'))
+        return 1
+    stamp = lambda t: time.strftime('%Y-%m-%d %H:%M', time.localtime(t)) if t else 'never'
+    try:
+        print('place:   %s (%s, %s)' % (cache.get('place') or '?', cache.get('lat'), cache.get('lon')))
+        print('fetched: %s (tried %s)' % (stamp(cache.get('fetched')), stamp(cache.get('tried'))))
+        n, t = cache.get('now'), cache.get('today')
+        if n:
+            print('now:     %d° %s' % (whole(n['temp']), n.get('text') or describe(n.get('code'))))
+        if t:
+            print('today:   %d° to %d°, rain up to %d %%%s (%s)' % (
+                whole(t['min']), whole(t['max']), t['rain_prob'],
+                ', likely from %s' % t['rain_from'] if t['rain_from'] else '', cache.get('date') or '?'))
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        print('(the cache is damaged: penguin-weather update rewrites it)')
+    print('screen:  %s' % (line(current()) or '(nothing: no recent data)'))
+    if cache.get('error'):
+        print('error:   %s' % cache['error'])
+    return 0
+
+
+def main(argv):
+    cmd, args = (argv[1] if len(argv) > 1 else ''), argv[2:]
+    if cmd == 'update' and not args:
+        return update()
+    if cmd == 'line' and not args:
+        text = line(current())
+        if text:
+            print(text)
+        return 0
+    if cmd == 'speech' and (not args or (len(args) == 2 and args[0] == '-v')):
+        print(speech(current(), args[1] if args else settings().get('SPEAK_VOICE') or 'en'))
+        return 0
+    if cmd == 'find' and args:
+        found = candidates(' '.join(args))
+        for lat, lon, label in found:
+            print('%.4f %.4f %s' % (lat, lon, label))
+        if not found:
+            raise RuntimeError('no place called "%s"' % ' '.join(args))
+        return 0
+    if cmd == 'set' and args:
+        return set_city(' '.join(args))
+    if cmd == 'show' and args in ([], ['--json']):
+        if args:
+            cache = load()
+            print(json.dumps(cache, ensure_ascii=False, indent=1) if cache else 'null')
+            return 0
+        return show()
+    print(__doc__.split('\n\n')[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as e:
+        print('penguin-weather: %s' % e, file=sys.stderr)
+        sys.exit(1)

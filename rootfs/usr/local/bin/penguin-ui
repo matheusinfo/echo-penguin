@@ -6,11 +6,21 @@ framebuffer console (80x21 cells of 12x22 pixels, rotated by the kernel), so the
 stack: Python's standard library only. Touches come from the goodix-ts input device, the volume
 buttons from gpio-keys.
 
-Screens: home (a large clock and six buttons), Logs (the log console, tty2: kernel errors, boot log
-and mirrored SSH/USB sessions, read back through /dev/vcs2 and shown under the header), System,
-Network & SSH, Clock (alarms, stopwatch, timer; each alarm's sound: a beep or a track from
-/data/penguin/music), Installed, Display & sound (brightness, which follows the room's light sensor
-with AUTO_BRIGHTNESS=1, and volume).
+Screens: home (a large clock, which says the time and the weather when tapped; the weather from
+penguin-weather; six buttons), Logs (the log console, tty2: kernel errors, boot log and mirrored
+SSH/USB sessions, read back through /dev/vcs2 and shown under the header), System, Network & SSH,
+Clock (alarms, stopwatch, timer, and the sleep diary's last nights; each alarm's sound: a beep or a
+track from /data/penguin/music), Installed, Display & sound (brightness, which follows the room's
+light sensor with AUTO_BRIGHTNESS=1, and volume).
+
+Around the alarms: a tap anywhere on a ringing alarm (or a volume button) stops it, and its volume
+climbs from WAKE_VOLUME_START (a percent of VOLUME) to VOLUME over WAKE_RAMP s. WAKE_LIGHT minutes
+before an alarm, a screen left alone shows a sunrise: warm colours that brighten while the backlight
+climbs. Once stopped, the alarm is followed by the time and the weather, spoken (SPEAK_ALARM). Left
+alone in a dark room, the screen shows only a dim night clock (NIGHT_CLOCK, NIGHT_COLOR). With
+SLEEP_LOG=1 the room going dark and lit again, and each alarm's ring and stop, go to the sleep diary
+that penguin-sleep reads. The colours come from the console's palette (ESC ] P), set for those views
+and reset when leaving them.
 """
 import base64
 import fcntl
@@ -45,6 +55,17 @@ BACKLIGHT_FILE = '/sys/class/leds/lcd-backlight/brightness'
 # The ambient light sensor: a JSA1214 (I2C 0-0044), driven by a vendor driver with stk3x1x names.
 # Reading 'als' returns the current count (0-4095, more light = more); 'send' writes a register.
 ALS_DIR = '/sys/bus/platform/drivers/als_ps'
+# The sleep diary: one event a line, {"t": epoch, "e": "dark"|"lit"|"ring"|"stop", "v": light}
+# ("v": "timeout" on the stop of a ring nobody answered). This process only appends, under the flock
+# that `penguin-sleep trim` holds while it replaces the file; penguin-sleep reads the nights from it.
+SLEEP_LOG = DATA + '/sleep-log.jsonl'
+CLOCK_SET = 1577836800           # 2020-01-01: before it the clock is not set yet (no NTP): no diary
+IDLE = 30                        # s without a touch before the night clock or the sunrise
+RING_MAX = 600                   # s an unanswered ring lasts
+STEADY = 120                     # s the room must stay dark (or lit) before the diary records it
+# The time and the weather, spoken: the text from penguin-weather, the voice from penguin-sound.
+SPEAK = ['sh', '-c', 'text=$(penguin-weather speech) && [ -n "$text" ] && exec penguin-sound say "$text"']
+DEVNULL = subprocess.DEVNULL
 
 EV_KEY, EV_ABS = 1, 3
 ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x35, 0x36, 0x39
@@ -99,6 +120,66 @@ def read(path, default=''):
         return default
 
 
+def file_stamp(path):
+    """(mtime, size) of a file, to notice it changed; None when it does not exist."""
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def hm(epoch):
+    return time.strftime('%H:%M', time.localtime(epoch))
+
+
+def spawn(cmd):
+    """Start a command in the background, its output thrown away; None when it cannot start. Nobody
+    waits for it (subprocess reaps it once its Popen is dropped)."""
+    try:
+        return subprocess.Popen(cmd, stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL)
+    except OSError:
+        return None
+
+
+class Job:
+    """A command run in the background whose output is wanted: read as it comes, never waited for.
+    Past its time limit it is stopped (SIGTERM); ok tells whether it ended well (exit status 0)."""
+
+    def __init__(self, cmd, limit):
+        self.out, self.limit, self.started, self.ok = b'', limit, time.time(), False
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=DEVNULL, stdout=subprocess.PIPE, stderr=DEVNULL)
+            os.set_blocking(self.proc.stdout.fileno(), False)
+        except OSError:
+            self.proc = None
+
+    def done(self):
+        """True once the command has ended (or was given up): then text() is its output."""
+        if self.proc is None:
+            return True
+        ended = self.proc.poll() is not None
+        try:
+            while True:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                self.out += chunk
+        except BlockingIOError:
+            pass
+        if not ended:
+            if time.time() - self.started < self.limit:
+                return False
+            self.proc.terminate()
+        self.ok = ended and self.proc.returncode == 0
+        self.proc.stdout.close()
+        self.proc = None
+        return True
+
+    def text(self):
+        return self.out.decode('utf-8', 'replace').strip()
+
+
 def settings():
     values = {}
     for path in SETTINGS:
@@ -125,11 +206,35 @@ def input_device(name):
 
 # --- Screen: a cell buffer, written to the console a changed line at a time.
 
+# A cell's attribute: bit 0 reverse video, bit 1 bold; bits 4-7 the foreground colour + 1 and bits
+# 8-11 the background colour + 1 (0: the default), colours being the console's eight (ANSI 0-7).
+RED, YELLOW = 1, 3               # the colours the night clock and the sunrise set in the palette
+
+
+def fg(colour):
+    return (colour + 1) << 4
+
+
+def bg(colour):
+    return (colour + 1) << 8
+
+
+def sgr(attr):
+    """The escape sequence that draws in an attribute."""
+    s = '\033[0' + (';7' if attr & 1 else '') + (';1' if attr & 2 else '')
+    if attr >> 4 & 15:
+        s += ';3%d' % ((attr >> 4 & 15) - 1)
+    if attr >> 8 & 15:
+        s += ';4%d' % ((attr >> 8 & 15) - 1)
+    return s + 'm'
+
+
 class Screen:
     def __init__(self, tty):
         self.out = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
         self.prev = [None] * ROWS
         self.presented = 0
+        self.shown_palette = {}
         self.clear()
         # MediaTek's display does not scan the framebuffer continuously: what fbcon draws reaches
         # the panel at its next frame update, often half-drawn. A pan with the same offsets after
@@ -143,8 +248,8 @@ class Screen:
             fcntl.ioctl(self.fb, 0x4600, self.var)  # FBIOGET_VSCREENINFO
         except OSError:
             self.fb = None
-        # Cursor off, no line wrap, auto-repeat irrelevant; never blank.
-        self.write('\033[?25l\033[?7l\033[9;0]\033[2J')
+        # The console's own palette (one left changed by a crash), cursor off, no line wrap, never blank.
+        self.write('\033]R\033[?25l\033[?7l\033[9;0]\033[2J')
 
     def write(self, s):
         data = s.encode('utf-8')
@@ -154,6 +259,7 @@ class Screen:
 
     def clear(self):
         self.cells = [[(' ', 0)] * COLS for _ in range(ROWS)]
+        self.palette = {}            # this frame's colours: colour -> 0xRRGGBB; {} = the console's own
 
     def text(self, row, col, s, attr=0):
         if not 0 <= row < ROWS:
@@ -175,12 +281,24 @@ class Screen:
         for r in range(row + 1, row + h - 1):
             self.text(r, col, '│' + ' ' * (w - 2) + '│', attr)
         self.text(row + h - 1, col, '└' + '─' * (w - 2) + '┘', attr)
-        mid = row + (h - 1) // 2 - (1 if sub else 0)
+        mid = row + max(1, (h - 1) // 2 - (1 if sub else 0))  # never on the top border (h = 4)
         self.center(mid, label, attr | 2, col, w)
         if sub:
             self.center(mid + 1, sub, attr, col, w)
 
     def flush(self, force=False):
+        if self.palette != self.shown_palette:
+            # The console's palette is per VT: ESC ] P sets one colour, ESC ] R puts them all back. On
+            # this truecolor framebuffer a change only reaches what is drawn after it, so every line is
+            # drawn again. A colour is set twice, for its bold (bright) version too.
+            reset = any(k not in self.palette for k in self.shown_palette)
+            seq = '\033]R' if reset else ''
+            for colour, rgb in sorted(self.palette.items()):
+                if reset or self.shown_palette.get(colour) != rgb:
+                    seq += ''.join('\033]P%x%06x' % (slot, rgb) for slot in (colour, colour + 8))
+            self.write(seq)
+            self.shown_palette = dict(self.palette)
+            force = True
         if force:
             self.prev = [None] * ROWS
         out = []
@@ -191,7 +309,7 @@ class Screen:
             line, cur = ['\033[%d;1H\033[0m' % (r + 1)], 0
             for ch, attr in cells:
                 if attr != cur:
-                    line.append('\033[0' + (';7' if attr & 1 else '') + (';1' if attr & 2 else '') + 'm')
+                    line.append(sgr(attr))
                     cur = attr
                 line.append(ch)
             out.append(''.join(line))
@@ -437,16 +555,9 @@ class Clocks:
         self.timer_end = None
         self.timer_left = 300
 
-    def file_stamp(self):
-        try:
-            st = os.stat(ALARMS_FILE)
-            return st.st_mtime_ns, st.st_size
-        except OSError:
-            return None
-
     def load(self):
         """Read the alarms. A file that does not parse (half written?) keeps the current ones."""
-        stamp = self.file_stamp()
+        stamp = file_stamp(ALARMS_FILE)
         path = ALARMS_FILE if stamp else OLD_ALARM_FILE
         try:
             with open(path) as f:
@@ -467,7 +578,7 @@ class Clocks:
 
     def reload_if_changed(self):
         """True when the file changed on disk (written by echo-manager or by hand) and was reloaded."""
-        stamp = self.file_stamp()
+        stamp = file_stamp(ALARMS_FILE)
         return stamp is not None and stamp != self.stamp and self.load()
 
     def save(self):
@@ -476,7 +587,7 @@ class Clocks:
             with open(ALARMS_FILE + '.tmp', 'w') as f:
                 json.dump({'alarms': self.alarms}, f)
             os.rename(ALARMS_FILE + '.tmp', ALARMS_FILE)
-            self.stamp = self.file_stamp()
+            self.stamp = file_stamp(ALARMS_FILE)
         except OSError:
             pass
 
@@ -571,6 +682,75 @@ class Light:
         return self.value
 
 
+class Room:
+    """Whether the room is dark, from the light sensor's smoothed reading, with hysteresis: dark at or
+    below LIGHT_DARK, lit again only above max(LIGHT_DARK * 2, LIGHT_DARK + 3), so a reading wavering
+    at the threshold does not flip it. The sleep diary takes a state once it has held for STEADY s,
+    dated from when it began."""
+
+    def __init__(self):
+        self.state = None            # 'dark' | 'lit'; None: no reading yet
+        self.since = 0               # when the state began
+        self.recorded = None         # the state this process last wrote to the diary
+
+    @staticmethod
+    def lit_above(light_dark):
+        return max(light_dark * 2, light_dark + 3)
+
+    def update(self, value, light_dark, now):
+        """Take a reading: (state, since) when a state has just held long enough for the diary."""
+        if value is None:
+            return None
+        if value <= light_dark:
+            state = 'dark'
+        elif value > self.lit_above(light_dark):
+            state = 'lit'
+        else:
+            state = self.state or 'lit'
+        if state != self.state or self.since < CLOCK_SET <= now:
+            self.state, self.since = state, now  # (a start before NTP set the clock counts from then)
+        if state != self.recorded and now - self.since >= STEADY:
+            self.recorded = state
+            return state, self.since
+        return None
+
+
+# The sunrise's sky, from a deep red to a pale warm white: (how far, (r, g, b)).
+SUNRISE = ((0.0, (0x30, 0x04, 0x00)), (0.35, (0xa0, 0x28, 0x00)), (0.7, (0xff, 0x90, 0x20)),
+           (1.0, (0xff, 0xe8, 0xb0)))
+# The night clock: (digits, the line under them), dim.
+NIGHT_COLOURS = {'red': (0x500000, 0x2c0000), 'amber': (0x502800, 0x2c1600)}
+
+
+def sunrise_colours(f):
+    """(sky, text) as 0xRRGGBB, f (0-1) of the way through the sunrise: the text lighter than a dark
+    sky and darker than a bright one."""
+    f = max(0.0, min(1.0, f))
+    sky = SUNRISE[-1][1]
+    for (f0, c0), (f1, c1) in zip(SUNRISE, SUNRISE[1:]):
+        if f <= f1:
+            k = (f - f0) / (f1 - f0)
+            sky = [round(a + (b - a) * k) for a, b in zip(c0, c1)]
+            break
+    if 0.3 * sky[0] + 0.59 * sky[1] + 0.11 * sky[2] < 60:
+        text = [min(255, round(v * 1.6) + add) for v, add in zip(sky, (0x50, 0x30, 0x08))]
+    else:
+        text = [round(v * 0.3) for v in sky]
+    return tuple(c[0] << 16 | c[1] << 8 | c[2] for c in (sky, text))
+
+
+def night_line(n):
+    """A night of the sleep diary on a line: day, lights off, up, how long, a bar of hours."""
+    try:
+        day = time.strftime('%a %d %b', time.strptime(n['date'], '%Y-%m-%d'))
+        bed, wake, mins = hm(n['bed']), hm(n['wake']), int(n['minutes'])
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return ''
+    bar = '█' * min(12, mins // 60) + ('▌' if mins % 60 >= 30 and mins < 12 * 60 else '')
+    return '%-10s  lights off %s  up %s  %-11s %s' % (
+        day, bed, wake, '%d h %02d min' % (mins // 60, mins % 60), bar)
+
+
 # --- The application.
 
 class App:
@@ -607,6 +787,28 @@ class App:
         self.down = False
         self.confirm, self.confirm_until = None, 0
         self.cooldown_until = 0
+        self.mode = 'ui'             # what was drawn last: 'ui' | 'ring' | 'sunrise' | 'night' | 'dark'
+        self.touched_at = time.time()  # the last tap or button press (IDLE)
+        self.room = Room()
+        self.diary = []              # sleep diary events waiting for the log's lock
+        self.sunrise = None         # how far the sunrise before the next alarm is (0-1); None: none now
+        self.overriding = False      # the sunrise or a ringing alarm sets the backlight
+        self.ramp = None             # the ringing alarm's volume ramp
+        self.vol_want = None         # the amplifier volume to set next...
+        self.vol_job = None          # ...and the penguin-sound setting one now
+        self.beep_proc = None        # the ring's last beeps
+        self.speak_due = None        # when an alarm was stopped: speak once the speaker is free
+        self.speech, self.spoke_at = None, 0
+        self.tools, self.tools_at = {}, 0
+        # Background commands: the weather (fetch, and the home screen's line), the sleep diary.
+        self.weather_line, self.weather_line_at, self.weather_line_job = '', 0, None
+        self.weather_job, self.weather_next, self.weather_loc = None, time.time() + 15, None
+        self.weather_started = 0
+        self.nights, self.nights_at, self.nights_job = None, 0, None
+        self.trim_at = time.time() + 600
+        # The amplifier at VOLUME, in the background: a restart in the middle of an alarm's ramp must
+        # not leave the speaker quiet.
+        self.want_volume(self.setting_int('VOLUME', 50, 0, 100))
         self.chvt(VT_UI)
 
     def open_input(self, name):
@@ -667,12 +869,24 @@ class App:
         f = (math.log1p(self.light.value) - math.log1p(dark)) / (math.log1p(bright) - math.log1p(dark))
         return round(lo + max(0.0, min(1.0, f)) * (hi - lo))
 
+    def light_override(self):
+        """The backlight level the sunrise asks for (BACKLIGHT_DARK climbing to BACKLIGHT), and after
+        it a ringing alarm (BACKLIGHT); None: the usual level."""
+        lo, hi = self.auto_range()
+        if self.clocks.ringing:
+            return hi if self.clocks.ringing == 'alarm' and self.setting_int('WAKE_LIGHT', 10, 0, 120) else None
+        if self.sunrise is not None:
+            return round(lo + self.sunrise * (hi - lo))
+        return None
+
     def follow_light(self):
-        """Called every loop: notice a screen turned off from outside, and with automatic brightness,
-        move the backlight toward the room's level a quarter of the way at a time (a short fade)."""
+        """Called every loop: notice a screen turned off from outside; during the sunrise and a ringing
+        alarm go to their level, and with automatic brightness to the room's: a quarter of the way at a
+        time (a short fade)."""
         if time.time() - self.conf_at > 5:
             self.conf, self.conf_at = settings(), time.time()
         cur = self.backlight()
+        light = self.light.poll()    # also for the night clock and the sleep diary
         if self.dark:
             if cur > 0 and self.bl_set == 0:
                 self.wake(cur)  # turned back on from outside: show the interface again
@@ -681,19 +895,31 @@ class App:
             # Turned off by echo-manager or over SSH: dark, as after Screen off, so a tap wakes it.
             self.go_dark(self.bl_set or self.setting_int('BACKLIGHT', 90) or 90)
             return
-        if not self.auto_wanted() or self.light.poll() is None:
-            self.bl_set = cur
-            return
-        if time.time() < self.hold_until:
-            goal = self.hold_level
+        override = self.light_override()
+        if override is not None:
+            self.overriding = True
+            goal = override
         else:
-            goal = self.auto_target()
-            # Hysteresis: small changes in the room's light leave the level alone, so the screen does
-            # not wander; the ends of the range are always reached.
-            if (self.bl_goal is not None and abs(goal - self.bl_goal) < max(3, self.bl_goal // 8)
-                    and goal not in self.auto_range()):
-                goal = self.bl_goal
-        self.bl_goal = goal
+            if self.overriding:
+                # The sunrise or the ring is over: automatic brightness fades back on its own; a fixed
+                # level is set again at once.
+                self.overriding, self.bl_goal = False, None
+                if not self.auto_wanted() and self.setting_int('BACKLIGHT', 90):
+                    self.backlight(self.setting_int('BACKLIGHT', 90))
+                    return
+            if not self.auto_wanted() or light is None:
+                self.bl_set = cur
+                return
+            if time.time() < self.hold_until:
+                goal = self.hold_level
+            else:
+                goal = self.auto_target()
+                # Hysteresis: small changes in the room's light leave the level alone, so the screen
+                # does not wander; the ends of the range are always reached.
+                if (self.bl_goal is not None and abs(goal - self.bl_goal) < max(3, self.bl_goal // 8)
+                        and goal not in self.auto_range()):
+                    goal = self.bl_goal
+            self.bl_goal = goal
         if cur != goal:
             step = max(1, abs(goal - cur) // 4)
             self.backlight(cur + step if goal > cur else cur - step)
@@ -721,6 +947,133 @@ class App:
                      else self.saved_bl or 90)
         self.backlight(level)
         self.scr.flush(force=True)
+
+    # The night clock, the sunrise and the sleep diary --------------------------------------
+
+    def sunrise_progress(self):
+        """How far the sunrise before the next alarm is (0-1): from WAKE_LIGHT minutes before it, while
+        nobody touches the screen. None: no sunrise now."""
+        mins = self.setting_int('WAKE_LIGHT', 10, 0, 120)
+        if not mins or self.clocks.ringing or time.time() - self.touched_at < IDLE:
+            return None
+        nxt = self.clocks.next_alarm()
+        if not nxt:
+            return None
+        secs = nxt[0] * 60 - time.localtime().tm_sec
+        return 1 - secs / (mins * 60) if 0 < secs <= mins * 60 else None
+
+    def night_wanted(self):
+        """NIGHT_CLOCK: auto, when nobody touched the screen for IDLE s in a dark room; on, whenever
+        nobody touched it; off, never."""
+        mode = self.conf.get('NIGHT_CLOCK', 'auto')
+        if mode not in ('auto', 'on') or time.time() - self.touched_at < IDLE:
+            return False
+        return mode == 'on' or self.room.state == 'dark'
+
+    def watch_room(self):
+        """Follow the room's light (the night clock) and write its changes to the sleep diary. During
+        the sunrise and a ring the screen's own light may reach the sensor: those readings are left out."""
+        if self.sunrise is not None or self.clocks.ringing:
+            return
+        value = self.light.poll()
+        changed = self.room.update(value, self.setting_int('LIGHT_DARK', 3, 0, 4095), time.time())
+        if changed:
+            self.sleep_event(changed[0], value, changed[1])
+
+    def sleep_event(self, event, value=None, when=None):
+        """An event for the sleep diary (SLEEP_LOG=1), written at once or, the log being busy, soon."""
+        t = int(when or time.time())
+        if self.conf.get('SLEEP_LOG', '1') != '1' or t < CLOCK_SET:
+            return
+        entry = {'t': t, 'e': event}
+        if value is not None:
+            entry['v'] = value
+        self.diary = (self.diary + [entry])[-100:]
+        self.write_diary()
+
+    def write_diary(self):
+        """Append the waiting events. `penguin-sleep trim` replaces the log (tmp + rename) under an
+        flock: take it without waiting (the loop must not stall; the events wait for the next turn),
+        and write only to the file that is there while it is held."""
+        if not self.diary:
+            return
+        try:
+            fd = os.open(SLEEP_LOG, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+        except OSError:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(fd).st_ino != os.stat(SLEEP_LOG).st_ino:
+                return  # replaced by a trim while it was opened: the new one next turn
+            data = ''.join(json.dumps(e) + '\n' for e in self.diary)
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b'\n':
+                data = '\n' + data  # a line cut short (power lost mid-write) must not swallow these
+            os.write(fd, data.encode())
+            self.diary = []
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def have(self, tool):
+        """Whether a command is installed (looked up again each minute: an update may bring it)."""
+        if time.time() - self.tools_at > 60:
+            self.tools, self.tools_at = {}, time.time()
+        if tool not in self.tools:
+            self.tools[tool] = shutil.which(tool) is not None
+        return self.tools[tool]
+
+    def background(self):
+        """The weather and the sleep diary's commands: started in the background and read once done,
+        never waited for, so drawing goes on."""
+        now = time.time()
+        lat, lon = self.conf.get('WEATHER_LAT', ''), self.conf.get('WEATHER_LON', '')
+        if lat and lon and self.have('penguin-weather'):
+            # Fetched shortly after start, then every 30 min; after a failure (at boot: no network yet,
+            # or TLS refused until NTP sets the clock) every 5 min; at once for a new place.
+            if self.weather_job is not None:
+                rc = self.weather_job.poll()
+                if rc is not None:
+                    self.weather_job = None
+                    self.weather_next = now + (1800 if rc in (0, 2) else 300)
+                    self.weather_line_at = 0  # the new data on the screen at once
+                elif now - self.weather_started > 120:
+                    self.weather_job.terminate()  # stuck (it gives up after ~15 s itself)
+                    self.weather_job, self.weather_next = None, now + 300
+            elif now >= self.weather_next or (self.weather_loc and self.weather_loc != (lat, lon)):
+                self.weather_loc, self.weather_started = (lat, lon), now
+                self.weather_job = spawn(['penguin-weather', 'update'])
+                self.weather_next = now + 1800
+            # The home screen's line, from the cache, every minute (one that failed keeps the last).
+            if self.weather_line_job is not None:
+                if self.weather_line_job.done():
+                    if self.weather_line_job.ok:
+                        self.weather_line = self.weather_line_job.text().split('\n')[0]
+                    self.weather_line_job = None
+            elif now - self.weather_line_at >= 60:
+                self.weather_line_at = now
+                self.weather_line_job = Job(['penguin-weather', 'line'], 2)
+        else:
+            self.weather_line = ''
+        # The Sleep tab's nights, every minute while it is shown.
+        if self.nights_job is not None:
+            if self.nights_job.done():
+                try:
+                    self.nights = json.loads(self.nights_job.text())
+                except ValueError:
+                    if self.nights is None:
+                        self.nights = {'error': True}  # else the last nights stay
+                self.nights_job = None
+        elif (self.mode == 'ui' and self.view == 'clock' and self.tab == 'sleep'
+              and now - self.nights_at >= 60 and self.have('penguin-sleep')):
+            self.nights_at = now
+            self.nights_job = Job(['penguin-sleep', 'nights', '--json'], 10)
+        # Once a day, the diary trimmed to its last weeks.
+        if now >= self.trim_at:
+            self.trim_at = now + 86400
+            if self.have('penguin-sleep') and os.path.exists(SLEEP_LOG):
+                spawn(['penguin-sleep', 'trim'])
 
     # Drawing -------------------------------------------------------------------------------
 
@@ -758,28 +1111,70 @@ class App:
             s.text(top + i, 12, str(v)[:COLS - 13])
 
     def draw(self):
+        """The frame: a ringing alarm or timer first, then the sunrise, the night clock, the interface."""
         s = self.scr
         s.clear()
         self.buttons = []
+        self.sunrise = self.sunrise_progress()
         if self.dark:
-            s.flush()
-            return
-        if self.clocks.ringing:
+            self.mode = 'dark'
+        elif self.clocks.ringing:
+            self.mode = 'ring'
             self.draw_ringing()
+        elif self.sunrise is not None:
+            self.mode = 'sunrise'
+            self.draw_sunrise()
+        elif self.night_wanted():
+            self.mode = 'night'
+            self.draw_night()
         else:
+            self.mode = 'ui'
             getattr(self, 'draw_' + self.view)()
         s.flush()
 
+    def next_ring(self):
+        """When an alarm rings next, for a line."""
+        nxt = self.clocks.next_alarm()
+        return 'alarm %02d:%02d' % (nxt[1]['h'], nxt[1]['m']) if nxt else ''
+
+    def draw_sunrise(self):
+        """WAKE_LIGHT minutes before an alarm: the screen is a sky that brightens, the time in it (the
+        backlight climbs with it, follow_light)."""
+        s = self.scr
+        # In steps of 3 s or more: each change of colour draws the whole screen again.
+        steps = max(1, min(120, self.setting_int('WAKE_LIGHT', 10, 0, 120) * 20))
+        sky, text = sunrise_colours(math.floor(self.sunrise * steps) / steps)
+        s.palette = {RED: sky, YELLOW: text}
+        paint = fg(YELLOW) | bg(RED)
+        for r in range(ROWS):
+            s.fill(r, paint)
+        for i, line in enumerate(big(time.strftime('%H:%M'))):
+            s.center(6 + i, line, paint)
+        s.center(13, self.next_ring(), paint)
+
+    def draw_night(self):
+        """A dark room (or NIGHT_CLOCK=on) and nobody at the screen: a dim clock and the next alarm."""
+        s = self.scr
+        digits, line = NIGHT_COLOURS.get(self.conf.get('NIGHT_COLOR'), NIGHT_COLOURS['red'])
+        s.palette = {RED: digits, YELLOW: line}
+        for i, row in enumerate(big(time.strftime('%H:%M'))):
+            s.center(7 + i, row, fg(RED))
+        s.center(14, self.next_ring(), fg(YELLOW))
+
     def draw_home(self):
         s = self.scr
+        c = self.clocks
         self.header('')
+        # Rows: header 0, a blank row under it (the big digits right under the bar look cut), clock
+        # 2-6, weather 8, date and next alarm 9, two rows of buttons four high at 11 and 15, footer 20.
         for i, line in enumerate(big(time.strftime('%H:%M:%S'))):
             s.center(2 + i, line, 2)
+        s.center(8, self.weather_line[:COLS - 2])
         status = time.strftime('%A, %d %B %Y')
-        nxt = self.clocks.next_alarm()
+        nxt = c.next_alarm()
         if nxt:
             status += '   ·   next alarm %02d:%02d, %s' % (nxt[1]['h'], nxt[1]['m'], REPEATS[nxt[1]['repeat']])
-        s.center(8, status)
+        s.center(9, status)
         w, gap = 25, 1
         x0 = (COLS - 3 * w - 2 * gap) // 2
         ip = (ip_of() or 'no network').split('/')[0]
@@ -788,10 +1183,16 @@ class App:
                  ('Clock', 'clock', 'alarm, stopwatch, timer'), ('Installed', 'installed', 'Docker, packages'),
                  ('Display & sound', 'display', 'brightness, volume')]
         for i, (label, action, sub) in enumerate(items):
-            row = 10 + (i // 3) * 5
+            row = 11 + (i // 3) * 4
             col = x0 + (i % 3) * (w + gap)
-            self.button(row, col, 5, w, label, action, sub)
-        self.footer('tap a button')
+            self.button(row, col, 4, w, label, action, sub)
+        # After the six, so a tap between two lines goes to them, as before: the big clock speaks the
+        # time and the weather.
+        self.buttons.append((2, 0, 5, COLS, 'speak'))
+        if self.have('penguin-weather') and self.have('penguin-sound'):
+            self.footer('tap a button, or the clock to hear the time and the weather')
+        else:
+            self.footer('tap a button')
 
     def draw_info(self, title, fn, every=5):
         if time.time() - self.info_at > every:
@@ -883,11 +1284,14 @@ class App:
         s = self.scr
         c = self.clocks
         self.header('Clock')
-        for i, (label, tab) in enumerate((('Alarm', 'alarm'), ('Stopwatch', 'stopwatch'), ('Timer', 'timer'))):
-            self.scr.box(2, 2 + i * 26, 3, 24, label, 1 if self.tab == tab else 0)
-            self.buttons.append((2, 2 + i * 26, 3, 24, 'tab-' + tab))
+        for i, (label, tab) in enumerate((('Alarm', 'alarm'), ('Stopwatch', 'stopwatch'), ('Timer', 'timer'),
+                                          ('Sleep', 'sleep'))):
+            self.scr.box(2, 1 + i * 20, 3, 18, label, 1 if self.tab == tab else 0)
+            self.buttons.append((2, 1 + i * 20, 3, 18, 'tab-' + tab))
         if self.tab == 'alarm':
             self.draw_alarm_list()
+        elif self.tab == 'sleep':
+            self.draw_sleep()
         elif self.tab == 'stopwatch':
             t = c.stopwatch()
             for i, line in enumerate(big('%02d:%02d.%d' % (t // 60, t % 60, (t * 10) % 10))):
@@ -925,6 +1329,43 @@ class App:
         nxt = c.next_alarm()
         self.footer('next: %02d:%02d, in %s' % (nxt[1]['h'], nxt[1]['m'], span(nxt[0])) if nxt
                     else 'all alarms are off' if c.alarms else '')
+
+    def draw_sleep(self):
+        """The sleep diary's last nights (penguin-sleep), and the light sensor next to LIGHT_DARK, to see
+        whether the threshold suits the room."""
+        s = self.scr
+        data = self.nights if isinstance(self.nights, dict) else {}
+        nights = [line for line in (night_line(n) for n in (data.get('nights') or [])[:7]
+                                    if isinstance(n, dict)) if line]
+        for i, line in enumerate(nights):
+            s.text(6 + i, 1, line[:COLS - 2])
+        if not nights:
+            if not self.have('penguin-sleep'):
+                msg = 'penguin-sleep is not installed: no sleep diary.'
+            elif self.nights is None:
+                msg = 'Reading the sleep diary...'
+            elif data.get('error'):
+                msg = 'penguin-sleep failed: no nights to show.'
+            else:
+                msg = 'No nights recorded yet.'
+            s.center(7, msg, 2)
+            s.center(9, 'A night is counted from the room going dark (the lights off) until the')
+            s.center(10, 'morning: the lights on again, or the alarm stopped.')
+        dark = self.setting_int('LIGHT_DARK', 3, 0, 4095)
+        light = self.light.value
+        s.text(14, 1, 'Light now', 2)
+        s.text(14, 13, 'no sensor reading' if light is None else
+               '%d: the room is %s' % (light, {'dark': 'dark', 'lit': 'lit'}.get(self.room.state, '?')))
+        s.text(15, 1, 'Dark at', 2)
+        s.text(15, 13, '%d or less (LIGHT_DARK), lit again above %d' % (dark, Room.lit_above(dark)))
+        s.text(16, 13, 'With the lights off the reading must be LIGHT_DARK or less, or no')
+        s.text(17, 13, 'night starts: then raise it (penguin set LIGHT_DARK N). Automatic')
+        s.text(18, 13, 'brightness takes the room as dark from the same setting.')
+        if self.conf.get('SLEEP_LOG', '1') != '1':
+            s.text(19, 13, 'SLEEP_LOG=0: the diary is off, nothing new is recorded.', 2)
+        avg = data.get('average_minutes')
+        self.footer('average of the last %d nights: %d h %02d min' % (min(7, len(nights)), avg // 60, avg % 60)
+                    if isinstance(avg, int) and nights else 'the nights come from the light sensor and the alarms')
 
     def draw_alarm(self):
         """One alarm: its time, on/off, repeat and sound; Delete asks for a second tap."""
@@ -988,6 +1429,10 @@ class App:
         c = self.clocks
         if action == 'stop-ring':
             self.stop_ring()
+        elif action == 'speak':
+            if time.time() - self.spoke_at >= 5:
+                self.spoke_at = time.time()
+                self.speak()
         elif action == 'back':
             if self.player_for == 'preview':
                 self.stop_player()
@@ -1041,6 +1486,8 @@ class App:
             self.view, self.info_at = action, 0
         elif action.startswith('tab-'):
             self.tab = action[4:]
+            if self.tab == 'sleep':
+                self.nights_at = 0  # read the diary again now
         elif action in ('h+', 'h-'):
             a = c.alarms[self.edit]
             a['h'] = (a['h'] + (1 if action == 'h+' else -1)) % 24
@@ -1147,18 +1594,104 @@ class App:
             except subprocess.TimeoutExpired:
                 pass
 
-    def stop_ring(self):
-        self.clocks.ringing = None
+    def stop_ring(self, by_hand=True):
+        """The ring is over (stopped, or RING_MAX passed): the volume back at VOLUME, and after an
+        alarm stopped by hand the time and the weather, spoken (SPEAK_ALARM=1) once the speaker is free."""
+        c = self.clocks
+        what, c.ringing = c.ringing, None
         if self.player_for == 'ring':
             self.stop_player()
+        self.end_ramp()
+        if what == 'alarm':
+            # A ring nobody answered is marked: nobody woke then (penguin-sleep tells them apart).
+            self.sleep_event('stop', None if by_hand else 'timeout')
+            if by_hand and self.conf.get('SPEAK_ALARM', '1') == '1':
+                self.speak_due = time.time()
+
+    # The alarm's volume ramp: the amplifier set through penguin-sound in the background, one at a
+    # time (an older one finishing last would leave the wrong level), at most once a second.
+
+    def start_ramp(self):
+        # WAKE_VOLUME_START is a percent of VOLUME (on the amplifier's 0-100 scale): 80 of 50 = 40.
+        secs = self.setting_int('WAKE_RAMP', 60, 0, 1800)
+        end = self.setting_int('VOLUME', 50, 0, 100)
+        start = min(end, round(end * self.setting_int('WAKE_VOLUME_START', 80, 0, 100) / 100))
+        if not secs or start >= end:
+            self.end_ramp()
+            return
+        self.ramp = {'t0': time.time(), 'secs': secs, 'start': start, 'end': end, 'level': start,
+                     'set_at': time.time()}
+        self.want_volume(start)
+
+    def ramp_step(self):
+        r = self.ramp
+        if not r or time.time() - r['set_at'] < 1:
+            return
+        f = min(1.0, (time.time() - r['t0']) / r['secs'])
+        level = round(r['start'] + f * (r['end'] - r['start']))
+        if level != r['level']:
+            r['level'], r['set_at'] = level, time.time()
+            self.want_volume(level)
+
+    def end_ramp(self):
+        if self.ramp:
+            self.ramp = None
+            self.want_volume(self.setting_int('VOLUME', 50, 0, 100))
+
+    def want_volume(self, level):
+        self.vol_want = level
+        self.volume_tick()
+
+    def volume_tick(self):
+        if self.vol_job is not None and self.vol_job.poll() is None:
+            return
+        self.vol_job = None
+        if self.vol_want is not None:
+            self.vol_job = spawn(['penguin-sound', 'volume', str(self.vol_want)])
+            self.vol_want = None
+
+    def vol_busy(self):
+        return self.vol_want is not None or (self.vol_job is not None and self.vol_job.poll() is None)
+
+    # Speech: penguin-weather writes the text, penguin-sound says it. Either one missing: nothing.
+
+    def speak(self):
+        if not (self.have('penguin-weather') and self.have('penguin-sound')):
+            return
+        if self.speech is None or self.speech.poll() is not None:
+            self.speech = spawn(SPEAK)
+
+    def speech_tick(self):
+        """After an alarm was stopped: speak once the speaker is free (one sound at a time, a second one
+        is skipped): the track stopped, the last beeps done, the volume back. Given up after 15 s."""
+        if self.speak_due is None:
+            return
+        if time.time() - self.speak_due > 15:
+            self.speak_due = None
+        elif (self.player is None and not self.vol_busy()
+              and (self.beep_proc is None or self.beep_proc.poll() is not None)):
+            self.speak_due = None
+            self.speak()
 
     def ring_sound(self):
-        """Keep the ring sounding: the alarm's track, over and over, else beeps."""
+        """Keep the ring sounding: the alarm's track, over and over, else beeps; an alarm's volume
+        climbing (WAKE_RAMP)."""
         c = self.clocks
         if self.ring_seen != c.ring_since:  # a new ring: a preview gives way, the track gets a chance
             self.ring_seen, self.music_failed = c.ring_since, False
             if self.player_for == 'preview':
                 self.stop_player()
+            self.speak_due = None
+            if self.speech is not None and self.speech.poll() is None:
+                self.speech.terminate()  # the ring comes first
+            if c.ringing == 'alarm':
+                self.sleep_event('ring')
+                self.start_ramp()
+            else:
+                self.end_ramp()
+        self.ramp_step()
+        if self.vol_busy() and time.time() - c.ring_since < 2:
+            return  # the ramp's first level before the first sound: it must not start loud
         music = c.music() if c.ringing == 'alarm' else None
         if music and not self.music_failed:
             if self.player_for == 'ring' and self.player.poll() is None:
@@ -1173,7 +1706,7 @@ class App:
                 return
         if time.time() - self.beep_at > 1.5:
             self.beep_at = time.time()
-            subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
+            self.beep_proc = spawn(['penguin-sound', 'beep', '988', '180', '3'])
 
     def volume(self, delta):
         cur = sh(['penguin-sound', 'volume'])
@@ -1190,9 +1723,12 @@ class App:
         # Touch coordinates are the panel's portrait axes; the screen is that turned 90 degrees.
         sx, sy = y, PANEL_SHORT - x
         col, row = min(COLS - 1, max(0, sx // CELL_W)), min(ROWS - 1, max(0, sy // CELL_H))
+        self.touched_at = time.time()
         if self.dark:
             self.wake()
             return
+        if self.mode in ('night', 'sunrise'):
+            return  # this tap only brings the interface back (the next frame); it presses nothing
         if os.environ.get('PENGUIN_UI_DEBUG'):
             with open('/run/penguin/ui-taps.log', 'a') as f:
                 f.write('touch %d,%d -> row %d col %d\n' % (x, y, row, col))
@@ -1243,30 +1779,45 @@ class App:
         for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
             _, _, etype, code, value = EVENT.unpack_from(data, i)
             if etype == EV_KEY and value == 1 and code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
+                self.touched_at = time.time()
                 if self.clocks.ringing:
                     self.stop_ring()
                 else:
                     self.volume(10 if code == KEY_VOLUMEUP else -10)
                 self.draw()
 
+    def step(self):
+        """One turn of the loop, up to the frame."""
+        c = self.clocks
+        c.tick()
+        if c.reload_if_changed() and self.view in ('alarm', 'sound'):
+            self.view = 'clock'  # the alarm being edited may be gone or moved
+            self.say('the alarms were changed elsewhere')
+        self.sunrise = self.sunrise_progress()
+        self.follow_light()
+        self.watch_room()
+        if c.ringing:
+            if self.dark:
+                self.wake()
+            if time.time() - c.ring_since > RING_MAX:
+                self.stop_ring(by_hand=False)  # ten minutes is enough
+            else:
+                self.ring_sound()
+        else:
+            if self.sunrise is not None and self.dark:
+                self.wake(self.light_override())  # the sunrise brings a screen turned off back
+            if self.player_for == 'preview' and self.player.poll() is not None:
+                self.player, self.player_for = None, None  # the preview played to its end
+        self.volume_tick()
+        self.speech_tick()
+        self.write_diary()
+        self.background()
+        self.draw()
+
     def run(self):
         fds = [fd for fd in (self.touch, self.keys) if fd is not None]
         while True:
-            self.clocks.tick()
-            if self.clocks.reload_if_changed() and self.view in ('alarm', 'sound'):
-                self.view = 'clock'  # the alarm being edited may be gone or moved
-                self.say('the alarms were changed elsewhere')
-            self.follow_light()
-            if self.clocks.ringing:
-                if self.dark:
-                    self.wake()
-                if time.time() - self.clocks.ring_since > 600:
-                    self.stop_ring()  # ten minutes is enough
-                else:
-                    self.ring_sound()
-            elif self.player_for == 'preview' and self.player.poll() is not None:
-                self.player, self.player_for = None, None  # the preview played to its end
-            self.draw()
+            self.step()
             fast = self.view == 'clock' and self.tab == 'stopwatch' and self.clocks.sw_start
             # Wake at each half second: the clock changes on the second, and the display needs a
             # trigger well within each second to stay out of its idle mode (Screen.present).

@@ -24,7 +24,7 @@ without anyone touching it. It is built on top of the
 - [What you get](#what-you-get)
 - [Goals and non-goals](#goals-and-non-goals)
 - [Quick start](#quick-start)
-- [Using the Echo](#using-the-echo) ([Alarms](#alarms), [Automatic brightness](#automatic-brightness), [Securing SSH](#securing-ssh))
+- [Using the Echo](#using-the-echo) ([Alarms](#alarms), [Waking up](#waking-up), [Weather and speech](#weather-and-speech), [Night clock](#night-clock), [Sleep diary](#sleep-diary), [Automatic brightness](#automatic-brightness), [Securing SSH](#securing-ssh))
 - [How it works](#how-it-works)
 - [Maintenance](#maintenance)
 - [Troubleshooting](#troubleshooting)
@@ -44,8 +44,8 @@ without anyone touching it. It is built on top of the
 | **Containers** | Docker (overlay2, data on `/data/docker`) on the `docker` kernel |
 | **Reliability** | hardware watchdog, temperature guard, weekly restart, rotated logs, A/B system slots with automatic rollback |
 | **Security** | firewall closes everything on Wi-Fi except SSH and the ports you choose |
-| **Screen** | a touch interface (clock, up to eight alarms with a beep or your own music, stopwatch, timer, system, network & SSH, installed software, logs, brightness/volume); brightness that follows the room's light; kernel and boot messages while it boots |
-| **Sound** | the built-in speaker (`penguin-sound`: beeps, WAV and MP3), the volume buttons |
+| **Screen** | a touch interface (clock, up to eight alarms with a beep or your own music, a sunrise and a rising volume before the alarm, stopwatch, timer, system, network & SSH, installed software, logs, brightness/volume); the weather; a dim night clock; a sleep diary; brightness that follows the room's light; kernel and boot messages while it boots |
+| **Sound** | the built-in speaker (`penguin-sound`: beeps, WAV and MP3, speech with espeak-ng), the volume buttons |
 
 Typical uses: a home lab node, a small self-hosted service, a Docker host for lightweight
 containers, an always-on SSH jump box.
@@ -165,6 +165,9 @@ ssh -i ~/.ssh/techo5 root@<echo-ip>
 | `penguin ssh` | SSH on/off, the allowed computers, the authorized keys and their fingerprints |
 | `penguin ssh allow here` / `deny ADDR` / `allow any` | add this computer to the SSH allow list, remove one, clear the list |
 | `penguin ssh on` / `off` | start or stop SSH |
+| `penguin-weather set CITY` / `show` / `update` | choose the weather's place by name, show the forecast, fetch it now |
+| `penguin-sleep nights` | the sleep diary's last nights and their average |
+| `penguin-sound say TEXT` | say a text (espeak-ng, voice `SPEAK_VOICE`) |
 | `penguin cleanup [--slot] [--yes]` | list what is no longer needed (installed rootfs tarballs, test files, stopped containers outside compose, untagged images); `--yes` removes it, `--slot` adds the inactive slot |
 
 **Settings.** Defaults live in [/etc/penguin/defaults.conf](rootfs/etc/penguin/defaults.conf);
@@ -183,18 +186,25 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 | `SCREEN_UI` | `1` | the touch interface; `0` = the screen shows the log console only |
 | `SCREEN_MIRROR` | `1` | show interactive SSH/USB sessions on the screen's log console |
 | `VOLUME` | `50` | speaker volume 0–100 |
+| `WAKE_LIGHT` / `WAKE_RAMP` | `10` / `60` | minutes of sunrise before an alarm; seconds the alarm's volume takes to climb (`0` = off) ([Waking up](#waking-up)) |
+| `WAKE_VOLUME_START` | `80` | where the alarm's volume starts, in percent of `VOLUME` (`100` = no climb) |
+| `NIGHT_CLOCK` / `NIGHT_COLOR` | `auto` / `red` | a dim clock in the dark ([Night clock](#night-clock)): `auto`, `on`, `off`; `red` or `amber` |
+| `WEATHER_LAT` / `WEATHER_LON` / `WEATHER_PLACE` | *(empty)* | the weather's place (`penguin-weather set CITY`); empty = no weather |
+| `SPEAK_ALARM` / `SPEAK_VOICE` | `1` / `en` | say the time and the weather after an alarm; the espeak-ng voice (`pt-br`, `es`, ...) |
+| `SLEEP_LOG` | `1` | record the [sleep diary](#sleep-diary); `0` = off |
 | `TEMP_CRIT` | `85` | °C at which running containers are paused |
 | `WEEKLY_REBOOT_DAY` / `_HOUR` | `0` / `4` | weekly restart (Sunday 04:00); empty = never |
 
-**The screen.** The home screen shows the time and six buttons: **Logs** (kernel errors, the boot
+**The screen.** The home screen shows the time, the [weather](#weather-and-speech) and six buttons: **Logs** (kernel errors, the boot
 log and every interactive SSH or USB-console session, live), **System**, **Network & SSH**,
 **Clock** ([alarms](#alarms); a stopwatch; a timer), **Installed** and **Display & sound**
-([brightness](#automatic-brightness), volume, screen off). `< Back` returns. The volume buttons on top
-change the volume, or stop a ringing alarm. The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on
+([brightness](#automatic-brightness), volume, screen off). `< Back` returns. Tapping the big clock
+says the time and the weather. The volume buttons on top change the volume, or stop a ringing
+alarm. The interface is [penguin-ui](rootfs/usr/local/bin/penguin-ui): plain text on
 the kernel's framebuffer console, Python's standard library only.
 
 **Sound.** `penguin-sound beep [Hz ms count]`, `penguin-sound play file.wav|file.mp3`,
-`penguin-sound volume [0-100]`. It holds the workaround the MediaTek playback driver needs (without
+`penguin-sound volume [0-100]`, `penguin-sound say [-v voice] text`. It holds the workaround the MediaTek playback driver needs (without
 it, the first sound panics the kernel), so use it rather than `aplay` directly. One sound plays at a
 time: another one asked for meanwhile is skipped. SIGTERM stops a playback cleanly.
 
@@ -204,8 +214,8 @@ Clock > Alarm lists the alarms, up to eight, in time order. Tap `+ Add an alarm`
 change it: its time, `Alarm is ON/OFF`, `Repeat:` (every day, Monday to Friday, Saturday and Sunday,
 or once, after which it turns itself off) and `Sound:`. `Delete` asks for a second tap. The `ON`/`off`
 box next to each alarm switches it without opening it. The home screen shows the next alarm due.
-Alarms that fall on the same minute ring once. A ringing alarm stops with a tap, the volume buttons,
-or by itself after ten minutes.
+Alarms that fall on the same minute ring once. A ringing alarm stops with a tap
+anywhere or the volume buttons; nobody answering, it stops by itself after ten minutes.
 
 The alarms are kept in `/data/penguin/alarms.json`, which the screen reloads by itself when it
 changes, so they can also be edited from a PC (the [Echo Manager](https://github.com/matheusinfo/echo-penguin-manager) desktop app does). Up to
@@ -213,7 +223,8 @@ v0.2.8 there was a single alarm, in `alarm.json`: it becomes the first alarm of 
 file is left alone, so a rollback to an older slot still finds its alarm.
 
 **Music.** An alarm can play a track instead of the beep. Tracks live in `/data/penguin/music/`, so
-they survive system updates: `.mp3` and `.wav` files (the extension in any case), copied in over SSH:
+they survive system updates: `.mp3` files, or `.wav` files recorded at 48 kHz, 16-bit, stereo (the
+extension in any case), copied in over SSH:
 
 ```bash
 ssh root@<ip> mkdir -p /data/penguin/music
@@ -223,8 +234,78 @@ scp 'My song.mp3' root@<ip>:/data/penguin/music/
 An alarm's `Sound:` button lists the built-in beep and every track in the folder (ten per page; new
 files show up without a restart). Tap one to choose it; `Play the chosen sound` previews it and
 `Stop` ends the preview. When the alarm rings, the track plays from the start, over and over, until
-you stop it, and the screen shows its name. If the track cannot play (the file is gone or broken),
-the alarm beeps instead: it never stays silent. The timer always beeps.
+you stop it, and the screen shows its name. If the track cannot play (the file is gone or broken, or
+a WAV in another format: the speaker's driver mishandles converted audio, so `penguin-sound` refuses
+it; convert it with `ffmpeg -i in.wav -ar 48000 -ac 2 out.wav`, or use MP3), the alarm beeps
+instead: it never stays silent. The timer always beeps.
+
+### Waking up
+
+**Sunrise.** `WAKE_LIGHT` minutes before an alarm (default 10), a screen nobody has touched for 30 s
+turns into a sky that goes from deep red through orange to a pale warm white, the time in the middle,
+while the backlight climbs from `BACKLIGHT_DARK` to `BACKLIGHT`; it does so even after `Screen off`.
+A tap brings the interface back for a while. The colours come from the console's own palette
+(`ESC ] P`), set step by step and reset afterwards.
+
+**Volume.** An alarm starts at `WAKE_VOLUME_START` percent of `VOLUME` (default 80) and climbs to
+`VOLUME` over `WAKE_RAMP` seconds (default 60): with `VOLUME=50` it starts at 40. The volume scale is
+the amplifier's, about 1.6 dB a point, so that start is some 16 dB under the full volume: soft, but
+clearly heard. The volume goes back to `VOLUME` once the alarm stops.
+
+**Then.** Once stopped by hand, the alarm is followed by the time and the weather, spoken
+([Weather and speech](#weather-and-speech)); `SPEAK_ALARM=0` keeps it silent.
+
+### Weather and speech
+
+The weather comes from [Open-Meteo](https://open-meteo.com) (free, no account; data under
+[CC BY 4.0](https://open-meteo.com/en/license)). Choose the place by name; the first match is used,
+and `City, Region` or `City, CC` narrows the search:
+
+```bash
+penguin-weather find "Campinas"          # the candidates, with their coordinates
+penguin-weather set "Campinas, Brazil"   # sets WEATHER_LAT, WEATHER_LON and WEATHER_PLACE, then fetches
+penguin-weather show                     # what the screen knows
+```
+
+The screen fetches it shortly after boot and every 30 minutes (every 2 minutes after a failure, as
+when the clock is not set yet), into `/run/penguin/weather.json`, and shows a line under the clock:
+`18° partly cloudy · 15°/24° · rain likely from 15h`. Data older than three hours is not shown.
+
+Speech uses espeak-ng, a small offline synthesizer with a robotic voice. `SPEAK_VOICE` picks the voice
+(`en`, `pt-br`, `es`, ...; `espeak-ng --voices` lists them), and the sentence follows its language:
+`Bom dia. São 5 e 30. Agora faz 18 graus, parcialmente nublado. Máxima de 24 graus.` It is said
+after an alarm is stopped and when the home screen's clock is tapped. From a shell:
+
+```bash
+penguin set SPEAK_VOICE pt-br
+penguin-sound say "$(penguin-weather speech)"
+```
+
+### Night clock
+
+Left alone for 30 s in a dark room, the screen shows only the time and the next alarm, in a dim red
+(`NIGHT_COLOR=amber` for amber), on top of automatic brightness's dark level. A tap brings the
+interface back (it presses nothing). The room counts as dark at a light reading of `LIGHT_DARK` or
+less, and as lit again above twice that (at least `LIGHT_DARK` + 3). `NIGHT_CLOCK=on` shows it
+whenever the screen is left alone, `off` never. A ringing alarm and the sunrise come first.
+
+### Sleep diary
+
+With `SLEEP_LOG=1`, the screen records when the room goes dark and lit again (once the change has
+held for two minutes) and each alarm's ring and stop, in `/data/penguin/sleep-log.jsonl`.
+[penguin-sleep](rootfs/usr/local/sbin/penguin-sleep) turns that into nights: from the lights off to
+the alarm stopped by hand (or, with no alarm, to the lights on between 03:00 and 13:00). Short
+interruptions (a light on for less than 30 minutes) do not split a night; a night when the alarm rang
+unanswered (you were away) is left out. Clock > Sleep shows the last seven nights and their average:
+
+```
+Mon 09 Nov  lights off 22:41  up 05:12  6 h 31 min  ██████▌
+```
+
+`penguin-sleep nights [--days N] [--json]` prints them from a shell. The same tab shows the light
+reading next to `LIGHT_DARK`: with the lights off, the reading must be `LIGHT_DARK` or less, or no
+night starts; if it is not, raise `LIGHT_DARK` (`penguin set LIGHT_DARK 8`), which also tunes
+automatic brightness and the night clock.
 
 ### Automatic brightness
 
@@ -426,8 +507,10 @@ flowchart TB
     INITD[busybox init] -->|sysinit| BOOT[boot.sh]
     INITD -->|respawn| RUN[techo5-run]
     INITD -->|respawn, tty1| UI[penguin-ui · touch screen]
-    UI -->|alarms, test| SND[penguin-sound · speaker]
-    ALS[light sensor] -->|automatic brightness| UI
+    UI -->|alarms, speech, test| SND[penguin-sound · speaker]
+    UI -->|every 30 min| WX[penguin-weather → Open-Meteo]
+    UI -->|events| SLP[sleep-log · penguin-sleep]
+    ALS[light sensor] -->|brightness, night clock, sleep diary| UI
     RUN --> SUP[supervisor · techo5]
     SUP -->|starts, restarts| DD[dockerd → containers]
     SUP -->|above TEMP_CRIT| PAUSE[pause containers]
@@ -543,7 +626,8 @@ rootfs/                 files laid over Alpine and TECHO5's rootfs
   etc/inittab           busybox init: boot, supervisor, USB console, touch interface
   usr/local/bin/techo5  the supervisor
   usr/local/bin/penguin-ui   the touch interface on the screen
-  usr/local/sbin/       penguin, penguin-sound, techo5-firewall, techo5-run, rebootto
+  usr/local/sbin/       penguin, penguin-sound, penguin-weather, penguin-sleep, techo5-firewall,
+                        techo5-run, rebootto
 scripts/                run on the PC
   setup.sh build-all.sh build-kernel.sh build-boot.sh build-rootfs.sh mkrootfs.sh
   install.sh finish-install.sh flash-boot.sh verify.sh
@@ -561,7 +645,7 @@ work/out/     the finished boot images, kernels and rootfs tarballs
 
 ## Status and next steps
 
-**Current version: v0.2.9** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+**Current version: v0.3.0** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
 the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
 power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
 SSH controls.

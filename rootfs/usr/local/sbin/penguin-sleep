@@ -1,0 +1,348 @@
+#!/usr/bin/python3
+"""penguin-sleep — the sleep diary, read from the room's light and the alarm.
+
+    penguin-sleep nights [--days N] [--json]       the nights of the last N days (default 14), newest first
+    penguin-sleep trim [--keep-days N]             drop events older than N days (default 60) from the log
+    penguin-sleep log EVENT [VALUE] [--at EPOCH]   append one event: dark, lit, ring, snooze or stop
+
+The log is /data/penguin/sleep-log.jsonl (PENGUIN_SLEEP_LOG overrides it), one JSON object per line,
+appended by penguin-ui while SLEEP_LOG=1: {"t": <epoch>, "e": <event>, "v": <value>}.
+  - dark / lit: the room has been dark / lit for 2 min; t = when it began, v = the light reading.
+  - ring, snooze, stop: the alarm (t = the moment). A stop with v "timeout" is penguin-ui giving up on
+    a ring nobody answered, not somebody waking.
+Lines that do not parse, unknown events and times before 2020 (the clock was not set) are skipped. The
+events are sorted by time, so their order in the file does not matter.
+
+How the nights are read:
+  - Dark spans run from a dark event to the next lit one. A dark repeated with no lit in between (penguin-ui
+    restarted, e.g. the weekly reboot on Sunday at 04:00) continues the span; a lit with no span open is
+    only the state. Spans with less than 30 min of light between them are one (a trip to the bathroom).
+  - A night with an alarm: a span with a stop, by hand, at least 1 h after it began, or up to 30 min after
+    it ended (the light may come on before the alarm is stopped). Lights off = the span's start, up = that
+    stop, or a later one within 30 min while the room is still dark (stopped, slept again, rang again).
+    Snoozes: those between the two.
+  - A night without an alarm: a span that ended at least 3 h after it began, between 03:00 and 13:00 local
+    time; up = when the light came on. When the span itself does not fit (somebody got up, then turned
+    the light off and left the room), the last light within it that fits is the wake. A ring nobody
+    answered between the two means nobody was there: no night (a day out with the lights off).
+  - Under 1 h or over 16 h is not a night. One night per wake date: the longest. A night still going on
+    (no wake yet) is not listed. The average is that of the newest 7 nights listed.
+Durations are differences of epoch times, so a DST change does not bend them; dates and clock times are
+local (/etc/localtime, or TZ).
+
+`trim` rewrites the log atomically (tmp + rename), keeping the events of the last N days plus the last
+dark or lit before them (the room's state). It and `log` hold an flock on the log while they work.
+"""
+import datetime
+import fcntl
+import json
+import os
+import sys
+import time
+
+LOG = os.environ.get('PENGUIN_SLEEP_LOG') or '/data/penguin/sleep-log.jsonl'
+EVENTS = ('dark', 'lit', 'ring', 'snooze', 'stop')
+CLOCK_SET = 1577836800           # 2020-01-01: an earlier time is a clock not set yet (boot.sh's test too)
+CLOCK_END = 1 << 40              # and a later one is garbage
+MERGE_GAP = 30 * 60              # s of light between two dark spans that still make one span
+STOP_AFTER = 30 * 60             # s after the light came on that a stop still ends the night
+REALARM = 30 * 60                # s: a later stop, while still dark, within this moves the wake
+RING_ANSWER = 15 * 60            # s a ring has to be snoozed or stopped in (penguin-ui gives up at 10 min)
+MIN_ALARM_SPAN = 3600            # s from lights off to the first stop that can end a night
+MIN_FREE_NIGHT = 3 * 3600        # s a night without an alarm lasts at least
+FREE_WAKE = (3 * 60, 13 * 60)    # local minutes of the day [from, to) a night without an alarm ends in
+MIN_NIGHT, MAX_NIGHT = 3600, 16 * 3600
+AVERAGE_OF = 7
+DAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+
+def parse(line):
+    """The event on one line of the log, with t an int, or None when the line is not a valid one."""
+    try:
+        ev = json.loads(line.strip().lstrip('﻿'))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(ev, dict) or ev.get('e') not in EVENTS:
+        return None
+    t = ev.get('t')
+    if isinstance(t, bool) or not isinstance(t, (int, float)) or not CLOCK_SET <= t < CLOCK_END:
+        return None  # NaN and infinities fail the comparison too
+    ev['t'] = int(t)
+    return ev
+
+
+def read_lines(f):
+    """(events sorted by time, file order among equal times; how many lines were not valid events)."""
+    events, bad = [], 0
+    for line in f:
+        if not line.strip():
+            continue
+        ev = parse(line)
+        if ev is None:
+            bad += 1
+        else:
+            events.append(ev)
+    events.sort(key=lambda ev: ev['t'])
+    return events, bad
+
+
+def read_events(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return read_lines(f)[0]
+    except FileNotFoundError:
+        return []
+
+
+def by_hand(ev):
+    return ev['e'] == 'stop' and ev.get('v') != 'timeout'
+
+
+def dark_spans(events):
+    """The merged dark spans: [start, end, lights], end None while the room is still dark, lights the
+    times the light came on within the span and at its end (a bathroom trip, then the morning)."""
+    raw, start = [], None
+    for ev in events:
+        if ev['e'] == 'dark' and start is None:
+            start = ev['t']
+        elif ev['e'] == 'lit' and start is not None:
+            if ev['t'] > start:
+                raw.append((start, ev['t']))
+            start = None
+    if start is not None:
+        raw.append((start, None))
+    spans = []
+    for s, e in raw:
+        if spans and spans[-1][1] is not None and s - spans[-1][1] < MERGE_GAP:
+            spans[-1][1] = e
+        else:
+            spans.append([s, e, []])
+        if e is not None:
+            spans[-1][2].append(e)
+    return spans
+
+
+def unattended_rings(events, now):
+    """When rings nobody snoozed or stopped by hand went off."""
+    out, pending = [], None
+    for ev in events:
+        if ev['e'] not in ('ring', 'snooze', 'stop'):
+            continue
+        if pending is not None:
+            answered = ev['e'] == 'snooze' or by_hand(ev)
+            if not answered or ev['t'] - pending > RING_ANSWER:
+                out.append(pending)
+            pending = None
+        if ev['e'] == 'ring':
+            pending = ev['t']
+    if pending is not None and now - pending > RING_ANSWER:
+        out.append(pending)
+    return out
+
+
+def minute_of_day(t):
+    lt = time.localtime(t)
+    return lt.tm_hour * 60 + lt.tm_min
+
+
+def night_of(span, stops, unattended):
+    """(bed, wake, alarm) of the night a dark span holds, or None."""
+    start, end, lights = span
+    limit = None if end is None else end + STOP_AFTER
+    wakes = [t for t in stops if t >= start + MIN_ALARM_SPAN and (limit is None or t < limit)]
+    if wakes:
+        wake = wakes[0]
+        for t in wakes[1:]:
+            if t - wake > REALARM or (end is not None and t >= end):
+                break
+            wake = t  # stopped, slept again in the dark, and the next alarm woke them
+        return (start, wake, True) if MIN_NIGHT <= wake - start <= MAX_NIGHT else None
+    for t in reversed(lights):  # the span's end first, then the lights within it
+        if (FREE_WAKE[0] <= minute_of_day(t) < FREE_WAKE[1]
+                and MIN_FREE_NIGHT <= t - start <= MAX_NIGHT
+                and not any(start <= r < t for r in unattended)):
+            return start, t, False
+    return None
+
+
+def nights(events, now, days=14):
+    """The nights whose wake falls in the last `days` local dates (today included), newest first."""
+    stops = [ev['t'] for ev in events if by_hand(ev)]
+    snoozes = [ev['t'] for ev in events if ev['e'] == 'snooze']
+    unattended = unattended_rings(events, now)
+    best = {}
+    for span in dark_spans(events):
+        n = night_of(span, stops, unattended)
+        if n is None:
+            continue
+        bed, wake, alarm = n
+        date = time.strftime('%Y-%m-%d', time.localtime(wake))
+        if date in best and best[date]['wake'] - best[date]['bed'] >= wake - bed:
+            continue
+        best[date] = {'date': date, 'bed': bed, 'wake': wake, 'minutes': int((wake - bed) / 60 + 0.5),
+                      'snoozes': sum(1 for t in snoozes if bed <= t <= wake), 'alarm': alarm}
+    first = (datetime.date.fromtimestamp(now) - datetime.timedelta(days=days - 1)).isoformat()
+    today = datetime.date.fromtimestamp(now).isoformat()
+    listed = sorted((n for n in best.values() if first <= n['date'] <= today), key=lambda n: -n['wake'])
+    recent = [n['minutes'] for n in listed[:AVERAGE_OF]]
+    return {'nights': listed, 'average_minutes': int(sum(recent) / len(recent) + 0.5) if recent else None,
+            'count': len(listed)}
+
+
+def duration(minutes):
+    return '%d h %02d min' % divmod(minutes, 60)
+
+
+def text(report, days):
+    """The report as lines that fit 78 columns."""
+    if not report['nights']:
+        return ['no nights recorded in the last %d day%s' % (days, '' if days == 1 else 's')]
+    lines = []
+    for n in report['nights']:
+        bed, wake = time.localtime(n['bed']), time.localtime(n['wake'])
+        note = '%d snooze%s' % (n['snoozes'], '' if n['snoozes'] == 1 else 's') if n['snoozes'] else ''
+        if not n['alarm']:
+            note = 'no alarm' + (', ' + note if note else '')
+        lines.append(('%s %02d %s  lights off %02d:%02d  up %02d:%02d  %11s  %s' % (
+            DAYS[wake.tm_wday], wake.tm_mday, MONTHS[wake.tm_mon - 1], bed.tm_hour, bed.tm_min,
+            wake.tm_hour, wake.tm_min, duration(n['minutes']), note)).rstrip())
+    shown = min(AVERAGE_OF, len(report['nights']))
+    lines.append('average (%d night%s): %s' % (shown, '' if shown == 1 else 's',
+                                               duration(report['average_minutes'])))
+    return lines
+
+
+def locked(path, flags):
+    """An fd of the log, flock'ed, that is still the file at `path` (trim may have replaced it)."""
+    while True:
+        fd = os.open(path, flags, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            if os.fstat(fd).st_ino == os.stat(path).st_ino:
+                return fd
+        except FileNotFoundError:
+            pass
+        os.close(fd)
+
+
+def append(path, ev):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    fd = locked(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
+    try:
+        line = json.dumps(ev) + '\n'
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b'\n':
+            line = '\n' + line  # a line cut short (power lost mid-write) must not swallow this one
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
+
+
+def trim(path, keep_days, now):
+    """(kept, dropped, unreadable lines dropped); the log is left alone when nothing would change."""
+    if now < CLOCK_SET:
+        raise RuntimeError('the clock is not set: not trimming')
+    try:
+        fd = locked(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return 0, 0, 0
+    try:
+        with open(fd, encoding='utf-8', errors='replace', closefd=False) as f:
+            events, bad = read_lines(f)
+        cutoff = now - keep_days * 86400
+        state = [ev for ev in events if ev['t'] < cutoff and ev['e'] in ('dark', 'lit')][-1:]
+        kept = state + [ev for ev in events if ev['t'] >= cutoff]
+        if len(kept) == len(events) and not bad:
+            return len(kept), 0, 0
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as out:
+            out.writelines(json.dumps(ev) + '\n' for ev in kept)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)  # still under the old file's lock: a waiting writer then reopens the new one
+        return len(kept), len(events) - len(kept), bad
+    finally:
+        os.close(fd)
+
+
+def option(args, name, default, low, high):
+    """Pops `name N` (or `name=N`) from args: an int in [low, high]."""
+    for i, a in enumerate(args):
+        if a == name or a.startswith(name + '='):
+            value = a[len(name) + 1:] if '=' in a else (args[i + 1] if i + 1 < len(args) else '')
+            del args[i:i + (1 if '=' in a else 2)]
+            try:
+                n = int(value)
+            except ValueError:
+                raise UsageError('%s needs a whole number' % name)
+            if not low <= n <= high:
+                raise UsageError('%s must be between %d and %d' % (name, low, high))
+            return n
+    return default
+
+
+class UsageError(Exception):
+    pass
+
+
+def number(text):
+    """A VALUE: an int or a finite float when it reads as one, else the text itself."""
+    for kind in (int, float):
+        try:
+            v = kind(text)
+        except ValueError:
+            continue
+        if v == v and abs(v) != float('inf'):
+            return v
+    return text
+
+
+def main(argv):
+    cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ('nights', [])
+    if cmd == 'nights':
+        days = option(args, '--days', 14, 1, 3660)
+        as_json = '--json' in args
+        args = [a for a in args if a != '--json']
+        if args:
+            raise UsageError('unexpected: %s' % ' '.join(args))
+        report = nights(read_events(LOG), time.time(), days)
+        if as_json:
+            print(json.dumps(report))
+        else:
+            print('\n'.join(text(report, days)))
+        return 0
+    if cmd == 'trim':
+        keep = option(args, '--keep-days', 60, 1, 36600)
+        if args:
+            raise UsageError('unexpected: %s' % ' '.join(args))
+        kept, dropped, bad = trim(LOG, keep, time.time())
+        print('kept %d events, dropped %d old ones and %d unreadable lines' % (kept, dropped, bad))
+        return 0
+    if cmd == 'log':
+        at = option(args, '--at', None, CLOCK_SET, CLOCK_END - 1)
+        if not 1 <= len(args) <= 2:
+            raise UsageError('log takes an EVENT and an optional VALUE')
+        if args[0] not in EVENTS:
+            raise UsageError('unknown event %r: one of %s' % (args[0], ', '.join(EVENTS)))
+        ev = {'t': int(time.time()) if at is None else at, 'e': args[0]}
+        if len(args) == 2:
+            ev['v'] = number(args[1])
+        if ev['t'] < CLOCK_SET:
+            raise RuntimeError('the clock is not set: not logging')
+        append(LOG, ev)
+        return 0
+    raise UsageError(None)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv))
+    except UsageError as e:
+        if e.args[0]:
+            print('penguin-sleep: %s' % e.args[0], file=sys.stderr)
+        print(__doc__.split('\n\n')[1], file=sys.stderr)
+        sys.exit(2)
+    except (OSError, RuntimeError) as e:
+        print('penguin-sleep: %s' % e, file=sys.stderr)
+        sys.exit(1)

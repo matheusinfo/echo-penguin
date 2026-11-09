@@ -61,3 +61,11 @@ under its own license:
 
 Vendor modules and firmware are read from the user's own unit or LineageOS
 zip during the build and are not distributed by this project.
+
+-------------------------------------------------------------------------------
+Weather data
+-------------------------------------------------------------------------------
+penguin-weather fetches forecasts and place names, on the unit and at run
+time, from Open-Meteo (https://open-meteo.com). Open-Meteo's data is licensed
+under CC BY 4.0 (https://open-meteo.com/en/license): "Weather data by
+Open-Meteo.com". None of it is part of this repository or of the images.
