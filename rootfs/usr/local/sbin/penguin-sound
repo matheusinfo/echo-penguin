@@ -3,7 +3,8 @@
 
     penguin-sound beep [HZ [MS [COUNT]]]   a tone (default 880 Hz, 200 ms, once)
     penguin-sound play FILE                an MP3 (mpg123) or a 48 kHz 16-bit stereo WAV; SIGTERM stops it
-    penguin-sound say [-v VOICE] TEXT...   TEXT spoken by espeak-ng (VOICE: en, pt-br, ...)
+    penguin-sound say [-e ENGINE] [-v VOICE] TEXT...         TEXT spoken (espeak-ng or Piper)
+    penguin-sound render [-e ENGINE] [-v VOICE] OUT TEXT...  the same into OUT (a WAV), not played
     penguin-sound volume [PERCENT]         show or set the amplifier volume (0-100)
 
 Playback is the MediaTek AFE's DL1 path, card 0 device 23 (S16_LE, stereo, 48 kHz). Two rules from
@@ -25,10 +26,13 @@ Only one sound plays at a time: a second one, while another plays, is skipped ra
 SIGTERM stops a playback cleanly (the players first, the held capture node last), which is how
 penguin-ui stops the alarm's music.
 
-say synthesizes with espeak-ng (22050 Hz mono), converts that to 48 kHz stereo into
-/run/penguin/say.wav, and plays it like a beep. VOICE is an espeak-ng voice; without -v it is
-SPEAK_VOICE from the settings (defaults.conf, then /data/penguin/settings.conf), else en. penguin-ui
-says the time and the weather with it (penguin-weather speech) after an alarm.
+say and render synthesize TEXT with ENGINE: espeak-ng (fast, robotic; VOICE an espeak-ng voice such as
+pt-br, default SPEAK_VOICE) or piper (Piper, a neural voice: natural, but some 40 s for a sentence on
+this CPU; VOICE a model in /data/penguin/voices or /usr/share/piper/voices, default PIPER_VOICE). The
+default engine is SPEAK_ENGINE, the settings read from defaults.conf, then /data/penguin/settings.conf.
+Either output (22050 Hz mono; Piper's in 32-bit float) is converted to 48 kHz stereo 16-bit, and say
+plays it like a beep. penguin-ui says the time and the weather with it (penguin-weather speech) after
+an alarm, rendering Piper's version ahead of the alarm.
 """
 import fcntl
 import math
@@ -56,6 +60,9 @@ VOLUME_CONTROLS = ('Master TAS5805m Playback Volume A',  # TI TAS5805M
 MAX98396_SAFE_MODE = 'Speaker Safe Mode A'  # a ~30 dB power cap the MAX98396 comes up with
 SETTINGS = ('/etc/penguin/defaults.conf', '/data/penguin/settings.conf')
 SAY_LIMIT = 60  # s: espeak-ng takes well under a second for a sentence
+PIPER_LIMIT = 300  # s: Piper takes some 40 s for a sentence here (most of it loading the model)
+PIPER = '/usr/local/bin/piper'
+VOICES = ('/data/penguin/voices', '/usr/share/piper/voices')
 
 
 def amixer(*args, check=False):
@@ -127,19 +134,51 @@ def settings():
     return values
 
 
+def read_wav(path):
+    """(channels, rate, samples) of a WAV file, the samples as signed 16-bit: 16-bit PCM as is, 32-bit
+    float (Piper's output, which Python's wave module does not read) scaled and clipped."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+        raise RuntimeError('%s: not a WAV file' % path)
+    pos, fmt, raw = 12, None, None
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], struct.unpack('<I', data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b'fmt ':
+            fmt = struct.unpack('<HHIIHH', body[:16])
+            if fmt[0] == 0xfffe and len(body) >= 26:  # WAVE_FORMAT_EXTENSIBLE: the real format follows
+                fmt = (struct.unpack('<H', body[24:26])[0],) + fmt[1:]
+        elif cid == b'data':
+            raw = body
+        pos += 8 + size + (size & 1)
+    if not fmt or raw is None:
+        raise RuntimeError('%s: no format or no data' % path)
+    tag, channels, rate, bits = fmt[0], fmt[1], fmt[2], fmt[5]
+    if tag == 1 and bits == 16:
+        samples = array('h')
+        samples.frombytes(raw[:len(raw) - len(raw) % 2])
+        if sys.byteorder == 'big':
+            samples.byteswap()
+    elif tag == 3 and bits == 32:
+        floats = array('f')
+        floats.frombytes(raw[:len(raw) - len(raw) % 4])
+        if sys.byteorder == 'big':
+            floats.byteswap()
+        clipped = map(max, repeat(-1.0), map(min, repeat(1.0), floats))
+        samples = array('h', map(int, map(mul, clipped, repeat(32767.0))))
+    else:
+        raise RuntimeError('%s: format %d, %d-bit: only 16-bit PCM or 32-bit float' % (path, tag, bits))
+    return channels, rate, samples
+
+
 def device_format(src, dst):
     """A 16-bit WAV converted to what device 23 takes (S16_LE, stereo, 48 kHz): linear interpolation,
     mono computed once for both sides. Built from map() and itertools, which loop in C: about two
     seconds on the unit for ten seconds of speech (a plain Python loop over the samples took five)."""
-    with wave.open(src, 'rb') as w:
-        channels, width, rate, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
-        raw = w.readframes(n)
-    if width != 2 or channels not in (1, 2) or not rate:
-        raise RuntimeError('%s: not a 16-bit mono or stereo WAV' % src)
-    samples = array('h')
-    samples.frombytes(raw[:len(raw) - len(raw) % (2 * channels)])
-    if sys.byteorder == 'big':
-        samples.byteswap()
+    channels, rate, samples = read_wav(src)
+    if channels not in (1, 2) or not rate:
+        raise RuntimeError('%s: not a mono or stereo WAV' % src)
     n = len(samples) // channels
     n_out = n * RATE // rate
     # Output sample i sits at input position i * rate / RATE: index j and fraction f (in 1/RATE). Both
@@ -181,27 +220,67 @@ def wav_format(path):
         return None
 
 
-def speech(text, voice, path):
-    """TEXT spoken by espeak-ng into a WAV file in the device's format (device_format), written
-    atomically."""
-    if not shutil.which('espeak-ng'):
-        raise RuntimeError('espeak-ng is not installed: say needs it')
+def piper_model(voice):
+    """The Piper model file of a voice name (or a path to one), from /data/penguin/voices first."""
+    if '/' in voice:
+        return voice
+    for d in VOICES:
+        path = os.path.join(d, voice if voice.endswith('.onnx') else voice + '.onnx')
+        if os.path.isfile(path):
+            return path
+    raise RuntimeError('no Piper voice %s in %s' % (voice, ' or '.join(VOICES)))
+
+
+def synthesize(engine, voice, text, path):
+    """TEXT spoken into a WAV file at path by espeak-ng or Piper, as it comes (not yet converted)."""
+    if engine == 'piper':
+        if not os.access(PIPER, os.X_OK):
+            raise RuntimeError('Piper is not installed (%s)' % PIPER)
+        cmd, limit = [PIPER, '-m', piper_model(voice), '-f', path], PIPER_LIMIT
+    else:
+        if not shutil.which('espeak-ng'):
+            raise RuntimeError('espeak-ng is not installed: say needs it')
+        # -w, not --stdout: its WAV header then holds the real length, not a streaming 2 GB.
+        cmd, limit = ['espeak-ng', '-v', voice, '-w', path], SAY_LIMIT
+    # The text goes on stdin, as it may start with a dash. espeak-ng reports a file it cannot write
+    # on stderr only, with exit status 0; Piper logs on stderr, so for it only the status counts.
+    r = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=limit)
+    why = (r.stderr or r.stdout).decode(errors='replace').strip()
+    if r.returncode or (engine != 'piper' and why) or not os.path.isfile(path) or os.path.getsize(path) <= 44:
+        raise RuntimeError('%s -v %s: %s' % (engine, voice, why.splitlines()[-1] if why else
+                                             'exit %d, no sound' % r.returncode))
+
+
+def speech(text, engine, voice, path):
+    """TEXT spoken into a WAV file in the device's format (device_format), written atomically."""
     tmp = '%s.%d.tmp' % (path, os.getpid())
     try:
-        # -w, not --stdout: its WAV header then holds the real length, not a streaming 2 GB. The text
-        # goes on stdin, as it may start with a dash. espeak-ng reports a file it cannot write on
-        # stderr only, with exit status 0.
-        r = subprocess.run(['espeak-ng', '-v', voice, '-w', tmp], input=text.encode(), capture_output=True,
-                           timeout=SAY_LIMIT)
-        why = (r.stderr or r.stdout).decode(errors='replace').strip()
-        if r.returncode or why or not os.path.isfile(tmp) or os.path.getsize(tmp) <= 44:  # 44: header only
-            raise RuntimeError('espeak-ng -v %s: %s' % (voice, why or 'exit %d, no sound' % r.returncode))
+        synthesize(engine, voice, text, tmp)
         device_format(tmp, tmp + '.48k')
         os.replace(tmp + '.48k', path)
     finally:
         for f in (tmp, tmp + '.48k'):
             if os.path.exists(f):
                 os.remove(f)
+
+
+def speech_options(args):
+    """(engine, voice, rest) from [-e ENGINE] [-v VOICE] ..., the defaults from the settings."""
+    engine = voice = None
+    while len(args) > 1 and args[0] in ('-e', '-v'):
+        if args[0] == '-e':
+            engine = args[1]
+        else:
+            voice = args[1]
+        args = args[2:]
+    conf = settings()
+    engine = engine or conf.get('SPEAK_ENGINE') or 'espeak'
+    if engine not in ('espeak', 'piper'):
+        raise RuntimeError('unknown engine %s (espeak or piper)' % engine)
+    if not voice:
+        voice = (conf.get('PIPER_VOICE') or 'pt_BR-faber-medium') if engine == 'piper' else (
+            conf.get('SPEAK_VOICE') or 'en')
+    return engine, voice, args
 
 
 def players(path, device):
@@ -280,16 +359,22 @@ def main(argv):
                 argv[2], 'not a WAV file' if fmt is None else '%d Hz, %d channel(s), %d-bit' % (
                     fmt[0], fmt[1], 8 * fmt[2])))
         return play(argv[2], DEVICE)
-    if cmd == 'say' and len(argv) > 2:
-        args, voice = argv[2:], None
-        if args[0] == '-v' and len(args) > 1:
-            args, voice = args[2:], args[1]
+    if cmd in ('say', 'render') and len(argv) > 2:
+        engine, voice, args = speech_options(argv[2:])
+        out = None
+        if cmd == 'render' and args:
+            out, args = args[0], args[1:]
         text = ' '.join(args).strip()
-        if text:
+        if text and (out or cmd == 'say'):
             os.makedirs(RUN, exist_ok=True)
-            path = os.path.join(RUN, 'say.wav')
-            speech(text, voice or settings().get('SPEAK_VOICE') or 'en', path)
-            return play(path, DEVICE)
+            path = out or os.path.join(RUN, 'say-%d.wav' % os.getpid())
+            speech(text, engine, voice, path)
+            if out:
+                return 0
+            try:
+                return play(path, DEVICE)
+            finally:
+                os.remove(path)
     if cmd == 'volume':
         print(volume(argv[2] if len(argv) > 2 else None))
         return 0

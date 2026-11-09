@@ -63,6 +63,17 @@ Vendor modules and firmware are read from the user's own unit or LineageOS
 zip during the build and are not distributed by this project.
 
 -------------------------------------------------------------------------------
+Piper and its voice
+-------------------------------------------------------------------------------
+scripts/build-piper.sh downloads Piper (piper-tts, libpiper: GPL-3.0) and the
+libraries it loads (onnxruntime: MIT; abseil: Apache-2.0; protobuf, re2: BSD;
+ICU; espeak-ng: GPL-3.0; libstdc++: GPL-3.0 with the runtime exception; musl:
+MIT) from Alpine Linux's edge repositories, and the pt_BR "faber" voice from
+https://huggingface.co/rhasspy/piper-voices (dataset CC0, fine-tuned from the
+en_US lessac voice, whose dataset has its own terms). The rootfs images the
+scripts build include them; the repository does not.
+
+-------------------------------------------------------------------------------
 Weather data
 -------------------------------------------------------------------------------
 penguin-weather fetches forecasts and place names, on the unit and at run

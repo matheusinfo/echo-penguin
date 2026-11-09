@@ -16,7 +16,8 @@ light sensor with AUTO_BRIGHTNESS=1, and volume).
 Around the alarms: a tap anywhere on a ringing alarm (or a volume button) stops it, and its volume
 climbs from WAKE_VOLUME_START (a percent of VOLUME) to VOLUME over WAKE_RAMP s. WAKE_LIGHT minutes
 before an alarm, a screen left alone shows a sunrise: warm colours that brighten while the backlight
-climbs. Once stopped, the alarm is followed by the time and the weather, spoken (SPEAK_ALARM). Left
+climbs. Once stopped, the alarm is followed by the time and the weather, spoken (SPEAK_ALARM): with
+SPEAK_ENGINE=piper in Piper's natural voice, rendered ahead of the alarm (it is slow here). Left
 alone in a dark room, the screen shows only a dim night clock (NIGHT_CLOCK, NIGHT_COLOR). With
 SLEEP_LOG=1 the room going dark and lit again, and each alarm's ring and stop, go to the sleep diary
 that penguin-sleep reads. The colours come from the console's palette (ESC ] P), set for those views
@@ -63,8 +64,18 @@ CLOCK_SET = 1577836800           # 2020-01-01: before it the clock is not set ye
 IDLE = 30                        # s without a touch before the night clock or the sunrise
 RING_MAX = 600                   # s an unanswered ring lasts
 STEADY = 120                     # s the room must stay dark (or lit) before the diary records it
-# The time and the weather, spoken: the text from penguin-weather, the voice from penguin-sound.
-SPEAK = ['sh', '-c', 'text=$(penguin-weather speech) && [ -n "$text" ] && exec penguin-sound say "$text"']
+# The time and the weather, spoken: the text from penguin-weather, the voice from penguin-sound. At once
+# (a tap on the clock, or no greeting rendered in time) it is espeak-ng: instant. With SPEAK_ENGINE=piper
+# the alarm's greeting is Piper's natural voice instead, which needs some 40 s for a sentence on this CPU:
+# rendered in the background SPEECH_AHEAD s before the alarm (niced), played when the alarm is stopped.
+SPEAK = ['sh', '-c', 'text=$(penguin-weather speech -e espeak) && [ -n "$text" ] '
+         '&& exec penguin-sound say -e espeak "$text"']
+RENDER = ['nice', '-n', '10', 'sh', '-c', 'text=$(penguin-weather speech -e piper --alarm "$1") '
+          '&& [ -n "$text" ] && exec penguin-sound render -e piper "$2" "$text"', 'render']
+PIPER = '/usr/local/bin/piper'
+SPEECH_AHEAD = 600               # s before an alarm its Piper greeting starts rendering
+SPEECH_WAIT = 60                 # s after a stop to wait for a greeting still rendering, then espeak-ng
+RUN = '/run/penguin'
 DEVNULL = subprocess.DEVNULL
 
 EV_KEY, EV_ABS = 1, 3
@@ -798,6 +809,8 @@ class App:
         self.vol_job = None          # ...and the penguin-sound setting one now
         self.beep_proc = None        # the ring's last beeps
         self.speak_due = None        # when an alarm was stopped: speak once the speaker is free
+        self.spoken_for = None       # the alarm (date and time) that was stopped, for its greeting
+        self.greeting = None         # the Piper greeting being rendered or ready: key, job, path
         self.speech, self.spoke_at = None, 0
         self.tools, self.tools_at = {}, 0
         # Background commands: the weather (fetch, and the home screen's line), the sleep diary.
@@ -1607,6 +1620,7 @@ class App:
             self.sleep_event('stop', None if by_hand else 'timeout')
             if by_hand and self.conf.get('SPEAK_ALARM', '1') == '1':
                 self.speak_due = time.time()
+                self.spoken_for = time.strftime('%Y-%m-%d %H:%M', time.localtime(c.ring_since))
 
     # The alarm's volume ramp: the amplifier set through penguin-sound in the background, one at a
     # time (an older one finishing last would leave the wrong level), at most once a second.
@@ -1661,17 +1675,63 @@ class App:
         if self.speech is None or self.speech.poll() is not None:
             self.speech = spawn(SPEAK)
 
+    def piper_wanted(self):
+        return (self.conf.get('SPEAK_ENGINE') == 'piper' and self.conf.get('SPEAK_ALARM', '1') == '1'
+                and os.access(PIPER, os.X_OK))
+
+    def render_greeting(self):
+        """SPEECH_AHEAD s before the next alarm, its greeting rendered by Piper in the background (once
+        per alarm); the file kept in /run/penguin until that alarm is stopped or another one comes."""
+        g = self.greeting
+        if g and g['job'] is not None and g['job'].poll() is not None:
+            g['ok'] = g['job'].returncode == 0 and os.path.isfile(g['path'])
+            g['job'] = None
+        if not self.piper_wanted() or self.clocks.ringing:
+            return
+        nxt = self.clocks.next_alarm()
+        if not nxt or nxt[0] * 60 > SPEECH_AHEAD + 60:
+            return
+        at = (int(time.time()) // 60 + nxt[0]) * 60
+        key = time.strftime('%Y-%m-%d %H:%M', time.localtime(at))
+        if g and g['key'] == key:
+            return
+        self.drop_greeting()
+        path = os.path.join(RUN, 'greeting-%s.wav' % time.strftime('%H%M', time.localtime(at)))
+        self.greeting = {'key': key, 'path': path, 'ok': False,
+                         'job': spawn(RENDER + [time.strftime('%H:%M', time.localtime(at)), path])}
+
+    def drop_greeting(self):
+        g, self.greeting = self.greeting, None
+        if g:
+            if g['job'] is not None and g['job'].poll() is None:
+                g['job'].terminate()
+            try:
+                os.remove(g['path'])
+            except OSError:
+                pass
+
     def speech_tick(self):
         """After an alarm was stopped: speak once the speaker is free (one sound at a time, a second one
-        is skipped): the track stopped, the last beeps done, the volume back. Given up after 15 s."""
+        is skipped): the track stopped, the last beeps done, the volume back. Piper's greeting for that
+        alarm when it is ready (waited for up to SPEECH_WAIT s while it renders), else espeak-ng at once.
+        Given up when the speaker stays busy for 15 s."""
         if self.speak_due is None:
             return
-        if time.time() - self.speak_due > 15:
+        g = self.greeting
+        g = g if g and g['key'] == self.spoken_for and not g.get('played') else None
+        waiting = time.time() - self.speak_due
+        if g and g['job'] is not None and waiting < SPEECH_WAIT:
+            return  # still rendering: give it a little longer
+        if waiting > (SPEECH_WAIT if g else 0) + 15:
             self.speak_due = None
         elif (self.player is None and not self.vol_busy()
               and (self.beep_proc is None or self.beep_proc.poll() is not None)):
             self.speak_due = None
-            self.speak()
+            if g and g['ok']:
+                self.speech = spawn(['penguin-sound', 'play', g['path']])
+                g['played'] = True  # its file goes when the next alarm's greeting is rendered
+            else:
+                self.speak()
 
     def ring_sound(self):
         """Keep the ring sounding: the alarm's track, over and over, else beeps; an alarm's volume
@@ -1812,6 +1872,7 @@ class App:
         self.speech_tick()
         self.write_diary()
         self.background()
+        self.render_greeting()
         self.draw()
 
     def run(self):

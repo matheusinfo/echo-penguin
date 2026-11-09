@@ -191,6 +191,7 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 | `NIGHT_CLOCK` / `NIGHT_COLOR` | `auto` / `red` | a dim clock in the dark ([Night clock](#night-clock)): `auto`, `on`, `off`; `red` or `amber` |
 | `WEATHER_LAT` / `WEATHER_LON` / `WEATHER_PLACE` | *(empty)* | the weather's place (`penguin-weather set CITY`); empty = no weather |
 | `SPEAK_ALARM` / `SPEAK_VOICE` | `1` / `en` | say the time and the weather after an alarm; the espeak-ng voice (`pt-br`, `es`, ...) |
+| `SPEAK_ENGINE` / `PIPER_VOICE` | `espeak` / `pt_BR-faber-medium` | `piper`: the alarm's greeting in Piper's natural voice, rendered ahead ([Weather and speech](#weather-and-speech)) |
 | `SLEEP_LOG` | `1` | record the [sleep diary](#sleep-diary); `0` = off |
 | `TEMP_CRIT` | `85` | °C at which running containers are paused |
 | `WEEKLY_REBOOT_DAY` / `_HOUR` | `0` / `4` | weekly restart (Sunday 04:00); empty = never |
@@ -271,15 +272,31 @@ The screen fetches it shortly after boot and every 30 minutes (every 2 minutes a
 when the clock is not set yet), into `/run/penguin/weather.json`, and shows a line under the clock:
 `18° partly cloudy · 15°/24° · rain likely from 15h`. Data older than three hours is not shown.
 
-Speech uses espeak-ng, a small offline synthesizer with a robotic voice. `SPEAK_VOICE` picks the voice
-(`en`, `pt-br`, `es`, ...; `espeak-ng --voices` lists them), and the sentence follows its language:
-`Bom dia. São 5 e 30. Agora faz 18 graus, parcialmente nublado. Máxima de 24 graus.` It is said
-after an alarm is stopped and when the home screen's clock is tapped. From a shell:
+Two offline voices say it, both on the unit:
+
+- **espeak-ng**, small and instant, with a robotic voice. `SPEAK_VOICE` picks it (`en`, `pt-br`, `es`,
+  ...; `espeak-ng --voices` lists them). It answers a tap on the home screen's clock.
+- **Piper**, a neural voice that sounds like a person reading, in Brazilian Portuguese
+  (`pt_BR-faber-medium`). This CPU needs about 40 seconds for a sentence, so with
+  `SPEAK_ENGINE=piper` the alarm's greeting is rendered in the background ten minutes before the
+  alarm, and played the moment the alarm is stopped. It says when the alarm rang (`Bom dia. O
+  despertador tocou às 5 e 30. Agora faz 18 graus, parcialmente nublado. Máxima de 24 graus.`); if it
+  is not ready, espeak-ng says the time now instead. Other Piper voices (`.onnx` and `.onnx.json`
+  from [piper-voices](https://huggingface.co/rhasspy/piper-voices)) can go in `/data/penguin/voices`
+  and be chosen with `PIPER_VOICE`.
+
+The sentence follows the voice's language (Portuguese for `pt*` voices, else English). From a shell:
 
 ```bash
-penguin set SPEAK_VOICE pt-br
-penguin-sound say "$(penguin-weather speech)"
+penguin set SPEAK_ENGINE piper                              # the alarm's greeting in Piper's voice
+penguin-sound say -e espeak "$(penguin-weather speech -e espeak)"
+penguin-sound say -e piper "$(penguin-weather speech -e piper)"   # about 40 s before it speaks
 ```
+
+Piper comes from Alpine's edge/testing repository, built against libraries newer than the
+system's, so [build-piper.sh](scripts/build-piper.sh) copies it with every library it loads and their
+own loader into `/usr/lib/piper` (about 21 MB, plus 63 MB of voice), apart from the system's libraries.
+`PIPER=0 scripts/build-rootfs.sh` leaves it out.
 
 ### Night clock
 
@@ -629,7 +646,7 @@ rootfs/                 files laid over Alpine and TECHO5's rootfs
   usr/local/sbin/       penguin, penguin-sound, penguin-weather, penguin-sleep, techo5-firewall,
                         techo5-run, rebootto
 scripts/                run on the PC
-  setup.sh build-all.sh build-kernel.sh build-boot.sh build-rootfs.sh mkrootfs.sh
+  setup.sh build-all.sh build-kernel.sh build-boot.sh build-rootfs.sh mkrootfs.sh build-piper.sh
   install.sh finish-install.sh flash-boot.sh verify.sh
   console.py console-push.py                  USB console helpers
   check-modversions.py bisect-crc.sh sdat2img.py   kernel/driver diagnostics
@@ -645,7 +662,7 @@ work/out/     the finished boot images, kernels and rootfs tarballs
 
 ## Status and next steps
 
-**Current version: v0.3.0** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+**Current version: v0.3.1** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
 the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
 power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
 SSH controls.

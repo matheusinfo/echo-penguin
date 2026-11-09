@@ -3,7 +3,8 @@
 
     penguin-weather update            fetch it now into /run/penguin/weather.json (WEATHER_LAT, WEATHER_LON)
     penguin-weather line              one line for the home screen; nothing without recent data
-    penguin-weather speech [-v VOICE] the spoken greeting: the time, then the weather (SPEAK_VOICE's language)
+    penguin-weather speech [-e ENGINE] [-v VOICE] [--alarm HH:MM]
+                                      the spoken greeting: the time (or when the alarm rang), then the weather
     penguin-weather find CITY         places by that name, one per line: LAT LON NAME, REGION, COUNTRY
     penguin-weather set CITY          make the first of them the location (penguin set), then update
     penguin-weather show [--json]     what the cache holds (--json: the cache itself, or null)
@@ -27,6 +28,11 @@ of rain left, rain_from the first hour with at least 50 %. date, utc_offset (the
 clock) and rain_hours (today's chance of rain hour by hour) let `line` and `speech` count from the
 current hour instead, and drop "today" once the place's day has changed. Data older than 3 hours is
 neither shown nor spoken. Temperatures are degrees Celsius.
+
+speech is in the language of the voice that will say it: VOICE, else the engine's (ENGINE, else
+SPEAK_ENGINE): PIPER_VOICE for piper, SPEAK_VOICE for espeak; Portuguese for pt*, else English.
+--alarm HH:MM says when the alarm rang instead of the time now: penguin-ui renders that greeting with
+Piper minutes ahead of an alarm, so it is ready when the alarm is stopped.
 
 PENGUIN_RUN (the cache's directory), PENGUIN_SETTINGS (the settings files, colon-separated) and
 PENGUIN_BIN (the penguin command) override the paths, for tests off the unit.
@@ -341,10 +347,32 @@ def at_hour_en(hour):
     return {0: 'midnight', 12: 'noon'}.get(hour, '%d %s' % (hour % 12, 'AM' if hour < 12 else 'PM'))
 
 
-def speech(w, voice, now=None):
+def alarm_pt(hour, minute):
+    if hour in (0, 12):
+        said = ('à meia-noite' if hour == 0 else 'ao meio-dia')
+    else:
+        said = '%s %s' % ('à' if hour == 1 else 'às', HOURS_PT.get(hour, str(hour)))
+        if not minute:
+            said += ' hora' if hour == 1 else ' horas'
+    return 'O despertador tocou %s%s.' % (said, ' e %d' % minute if minute else '')
+
+
+def alarm_en(hour, minute):
+    if minute == 0:
+        at = {0: 'midnight', 12: 'noon'}.get(hour, "%d o'clock" % (hour % 12))
+    else:
+        at = '%d %s%d' % (hour % 12 or 12, 'oh ' if minute < 10 else '', minute)
+    return 'The alarm went off at %s.' % at
+
+
+def speech(w, voice, now=None, alarm=None):
+    """The greeting in voice's language: the time now, or with alarm=(hour, minute) when it rang."""
     pt = voice.lower().startswith('pt')
     lt = time.localtime(time.time() if now is None else now)
-    said = [greeting(lt.tm_hour, pt), clock_pt(lt.tm_hour, lt.tm_min) if pt else clock_en(lt.tm_hour, lt.tm_min)]
+    if alarm:
+        said = [greeting(alarm[0], pt), alarm_pt(*alarm) if pt else alarm_en(*alarm)]
+    else:
+        said = [greeting(lt.tm_hour, pt), clock_pt(lt.tm_hour, lt.tm_min) if pt else clock_en(lt.tm_hour, lt.tm_min)]
     if w:
         n, t = w['now'], w['today']
         text = describe(n.get('code'), pt)
@@ -446,8 +474,21 @@ def main(argv):
         if text:
             print(text)
         return 0
-    if cmd == 'speech' and (not args or (len(args) == 2 and args[0] == '-v')):
-        print(speech(current(), args[1] if args else settings().get('SPEAK_VOICE') or 'en'))
+    if cmd == 'speech':
+        opts = dict(zip(args[::2], args[1::2]))
+        if len(args) % 2 or set(opts) - {'-e', '-v', '--alarm'}:
+            raise RuntimeError('usage: penguin-weather speech [-e ENGINE] [-v VOICE] [--alarm HH:MM]')
+        conf = settings()
+        engine = opts.get('-e') or conf.get('SPEAK_ENGINE') or 'espeak'
+        voice = opts.get('-v') or (conf.get('PIPER_VOICE') or 'pt_BR-faber-medium' if engine == 'piper'
+                                   else conf.get('SPEAK_VOICE') or 'en')
+        alarm = None
+        if '--alarm' in opts:
+            m = re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', opts['--alarm'])
+            if not m:
+                raise RuntimeError('--alarm: HH:MM')
+            alarm = int(m.group(1)), int(m.group(2))
+        print(speech(current(), voice, alarm=alarm))
         return 0
     if cmd == 'find' and args:
         found = candidates(' '.join(args))

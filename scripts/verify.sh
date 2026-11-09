@@ -55,6 +55,7 @@ eval "$(on '. /lib/penguin.sh; p_settings
 	echo "fbcon=$(grep -c "frame buffer" /sys/class/vtconsole/vtcon*/name 2>/dev/null | grep -c ":1")"
 	echo "vol=$(/usr/local/sbin/penguin-sound volume 2>/dev/null)"
 	echo "espeak=$(command -v espeak-ng >/dev/null && echo 1 || echo 0)"
+	echo "piper=$([ -x /usr/local/bin/piper ] && ls /usr/share/piper/voices/*.onnx >/dev/null 2>&1 && echo 1 || echo 0) engine=\"$SPEAK_ENGINE\""
 	echo "sleepd=$(/usr/local/sbin/penguin-sleep nights --json >/dev/null 2>&1 && echo 1 || echo 0)"
 	echo "wxplace=\"$WEATHER_PLACE\" wxlat=\"$WEATHER_LAT\""
 	echo "wxline=\"$(/usr/local/sbin/penguin-weather line 2>/dev/null | tr -d "\"\\$\`")\""')"
@@ -82,6 +83,8 @@ fi
 [ "${touch:-0}" = 1 ] && pass "touchscreen present (goodix-ts)" || fail "no goodix-ts input device"
 case "$vol" in [0-9]*) pass "speaker volume control: $vol %";; *) fail "no speaker volume control (penguin-sound volume)";; esac
 [ "${espeak:-0}" = 1 ] && pass "speech (espeak-ng)" || warn "espeak-ng missing: no speech after an alarm"
+if [ "${piper:-0}" = 1 ]; then pass "natural voice (Piper)${engine:+, SPEAK_ENGINE=$engine}"
+elif [ "$engine" = piper ]; then warn "SPEAK_ENGINE=piper but no Piper or no voice: espeak-ng speaks instead"; fi
 [ "${sleepd:-0}" = 1 ] && pass "sleep diary readable (penguin-sleep)" || warn "penguin-sleep nights failed"
 if [ -n "$wxlat" ]; then
 	[ -n "$wxline" ] && pass "weather for ${wxplace:-$wxlat}: $wxline" || warn "weather set (${wxplace:-$wxlat}) but no recent forecast (penguin-weather show)"
