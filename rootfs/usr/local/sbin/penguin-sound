@@ -356,6 +356,12 @@ def prepare(voice, texts, keep=False):
                     os.remove(path)
             except OSError:
                 pass
+    if keep:  # one rendered into TEMP meanwhile is kept too: there it goes after TEMP_AGE s
+        for t in texts:
+            path = cached(voice, t)
+            if path and path != clip(voice, t, True):
+                with wave.open(path, 'rb') as w:
+                    write_wav(clip(voice, t, True), w.readframes(w.getnframes()))
     missing = [t for t in texts if not cached(voice, t)]
     if not missing:
         return
