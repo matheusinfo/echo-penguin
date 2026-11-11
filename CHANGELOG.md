@@ -6,6 +6,46 @@ version that first needed them. Every version below ran on an Echo Show 5 2nd ge
 
 ## Unreleased
 
+## v0.3.2 — 2026-11-11
+
+One voice, and a lighter unit.
+
+- The home clock speaks in the alarm's voice. A tap on it was answered by espeak-ng's robotic voice,
+  as Piper needs some 19 s to load and seconds more a phrase; it is now said at once from clips Piper
+  rendered ahead: the hours and the minutes once (110 clips, about ten minutes niced in the background
+  after the first start or a change of voice, kept in `/data/penguin/speech`), the weather's sentences
+  after each fetch. Until they are there a tap says what is ready, or that the voice is being prepared.
+- espeak-ng is gone as a voice: `SPEAK_ENGINE` and `SPEAK_VOICE` are no longer settings (lines left
+  in `settings.conf` are ignored), `PIPER_VOICE` is the voice everywhere, and an alarm's greeting
+  that was not rendered in time is said from the clips. The package stays, for the phoneme data Piper
+  reads. An image built with `PIPER=0` has no speech.
+- `penguin-sound`: each line of a text is a clip, rendered once (the missing ones of a call by one
+  Piper run), trimmed, stored as the speaker takes it and joined when said. `prepare [--keep]`
+  renders clips ahead, `say --ready` says only what is there. One Piper at a time. `-e` is accepted
+  and ignored.
+- `penguin-weather speech --clips` prints the greeting as clips, the time as its hour and its
+  minutes; `phrases` lists every clip the clock can need. `line` and `speech` no longer load Python's
+  HTTP and TLS modules (half their start).
+- `penguin-ui`: the home screen started `ip` on every frame (twice a second, all day) and Display &
+  sound started `penguin-sound volume` (Python, then `amixer`): both are now read every 10 s. The
+  weather's line is refreshed only while the home screen shows it, a finger on the screen no longer
+  runs a whole step per batch of touch events, and a stopwatch left running no longer keeps the loop
+  at 10 Hz under the night clock. A missing `penguin-sound` no longer ends the UI at a beep.
+- The supervisor asked `docker info` every 15 s (the Docker CLI started and a full report from
+  dockerd, a quarter of a core while it ran); it now looks for the process and its socket.
+- A `settings.conf` the shell cannot parse (an unclosed quote, edited by hand) ended `boot.sh` before
+  the network came up, the supervisor and `penguin set` itself; it is now left out, with a message.
+  `penguin set` writes the file whole and renames it, so a power cut cannot drop a setting.
+- Boot: the screen and the alarms no longer wait for the network. `boot.sh` joined Wi-Fi, took a
+  lease and set the clock before ending, and init starts `penguin-ui` only then: with the router off,
+  60 to 130 s without a clock at every boot. That part now runs in the background; the weather's first
+  fetch is retried every minute for five.
+- A router off for the night no longer restarts the unit every 16 minutes: the reboot after 15
+  minutes without an address happens once an outage (`net-reboot` in the log folder marks it until
+  the network is back); Wi-Fi is still retried every minute.
+- `rebootto` waited its whole 40 s for a supervisor that init had already started again, which could
+  start dockerd just before the reboot; it holds the supervisor first (`/run/techo5/hold`).
+
 ## v0.3.1 — 2026-11-09
 
 A natural voice for the alarm's greeting.

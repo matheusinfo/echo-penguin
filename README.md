@@ -45,7 +45,7 @@ without anyone touching it. It is built on top of the
 | **Reliability** | hardware watchdog, temperature guard, weekly restart, rotated logs, A/B system slots with automatic rollback |
 | **Security** | firewall closes everything on Wi-Fi except SSH and the ports you choose |
 | **Screen** | a touch interface (clock, up to eight alarms with a beep or your own music, a sunrise and a rising volume before the alarm, stopwatch, timer, system, network & SSH, installed software, logs, brightness/volume); the weather; a dim night clock; a sleep diary; brightness that follows the room's light; kernel and boot messages while it boots |
-| **Sound** | the built-in speaker (`penguin-sound`: beeps, WAV and MP3, speech with espeak-ng), the volume buttons |
+| **Sound** | the built-in speaker (`penguin-sound`: beeps, WAV and MP3, speech with Piper), the volume buttons |
 
 Typical uses: a home lab node, a small self-hosted service, a Docker host for lightweight
 containers, an always-on SSH jump box.
@@ -167,7 +167,7 @@ ssh -i ~/.ssh/techo5 root@<echo-ip>
 | `penguin ssh on` / `off` | start or stop SSH |
 | `penguin-weather set CITY` / `show` / `update` | choose the weather's place by name, show the forecast, fetch it now |
 | `penguin-sleep nights` | the sleep diary's last nights and their average |
-| `penguin-sound say TEXT` | say a text (espeak-ng, voice `SPEAK_VOICE`) |
+| `penguin-sound say TEXT` | say a text (Piper, voice `PIPER_VOICE`; about 20 s before it speaks) |
 | `penguin cleanup [--slot] [--yes]` | list what is no longer needed (installed rootfs tarballs, test files, stopped containers outside compose, untagged images); `--yes` removes it, `--slot` adds the inactive slot |
 
 **Settings.** Defaults live in [/etc/penguin/defaults.conf](rootfs/etc/penguin/defaults.conf);
@@ -190,8 +190,7 @@ your overrides go to `/data/penguin/settings.conf`. The most useful ones:
 | `WAKE_VOLUME_START` | `80` | where the alarm's volume starts, in percent of `VOLUME` (`100` = no climb) |
 | `NIGHT_CLOCK` / `NIGHT_COLOR` | `auto` / `red` | a dim clock in the dark ([Night clock](#night-clock)): `auto`, `on`, `off`; `red` or `amber` |
 | `WEATHER_LAT` / `WEATHER_LON` / `WEATHER_PLACE` | *(empty)* | the weather's place (`penguin-weather set CITY`); empty = no weather |
-| `SPEAK_ALARM` / `SPEAK_VOICE` | `1` / `en` | say the time and the weather after an alarm; the espeak-ng voice (`pt-br`, `es`, ...) |
-| `SPEAK_ENGINE` / `PIPER_VOICE` | `espeak` / `pt_BR-faber-medium` | `piper`: the alarm's greeting in Piper's natural voice, rendered ahead ([Weather and speech](#weather-and-speech)) |
+| `SPEAK_ALARM` / `PIPER_VOICE` | `1` / `pt_BR-faber-medium` | say the time and the weather after an alarm; the Piper voice that says them, there and at a tap on the clock ([Weather and speech](#weather-and-speech)) |
 | `SLEEP_LOG` | `1` | record the [sleep diary](#sleep-diary); `0` = off |
 | `TEMP_CRIT` | `85` | °C at which running containers are paused |
 | `WEEKLY_REBOOT_DAY` / `_HOUR` | `0` / `4` | weekly restart (Sunday 04:00); empty = never |
@@ -272,26 +271,30 @@ The screen fetches it shortly after boot and every 30 minutes (every 2 minutes a
 when the clock is not set yet), into `/run/penguin/weather.json`, and shows a line under the clock:
 `18° partly cloudy · 15°/24° · rain likely from 15h`. Data older than three hours is not shown.
 
-Two offline voices say it, both on the unit:
+An offline voice says it, on the unit: **Piper**, a neural voice that sounds like a person reading,
+in Brazilian Portuguese (`pt_BR-faber-medium`). This CPU is slow for it (some 19 seconds to load the
+voice, then 2 to 7 seconds a phrase), so nothing is rendered at the moment it is wanted:
 
-- **espeak-ng**, small and instant, with a robotic voice. `SPEAK_VOICE` picks it (`en`, `pt-br`, `es`,
-  ...; `espeak-ng --voices` lists them). It answers a tap on the home screen's clock.
-- **Piper**, a neural voice that sounds like a person reading, in Brazilian Portuguese
-  (`pt_BR-faber-medium`). This CPU needs about 40 seconds for a sentence, so with
-  `SPEAK_ENGINE=piper` the alarm's greeting is rendered in the background ten minutes before the
-  alarm, and played the moment the alarm is stopped. It says when the alarm rang (`Bom dia. O
-  despertador tocou às 5 e 30. Agora faz 18 graus, parcialmente nublado. Máxima de 24 graus.`); if it
-  is not ready, espeak-ng says the time now instead. Other Piper voices (`.onnx` and `.onnx.json`
-  from [piper-voices](https://huggingface.co/rhasspy/piper-voices)) can go in `/data/penguin/voices`
-  and be chosen with `PIPER_VOICE`.
+- **After an alarm**, the greeting is rendered whole in the background ten minutes before the alarm,
+  and played the moment the alarm is stopped. It says when the alarm rang (`Bom dia. O despertador
+  tocou às 5 e 30. Agora faz 18 graus, parcialmente nublado. Máxima de 24 graus.`).
+- **A tap on the home screen's clock** is answered at once, in the same voice, from clips rendered
+  ahead: the hours and the minutes once (110 clips, about ten minutes in the background after the
+  first start or a change of voice, kept in `/data/penguin/speech`, some 15 MB), the weather's
+  sentences after each fetch. Until the clips are there, a tap says what is ready.
 
-The sentence follows the voice's language (Portuguese for `pt*` voices, else English). From a shell:
+Other Piper voices (`.onnx` and `.onnx.json` from
+[piper-voices](https://huggingface.co/rhasspy/piper-voices)) can go in `/data/penguin/voices` and be
+chosen with `PIPER_VOICE`. The sentence follows the voice's language (Portuguese for `pt*` voices,
+else English). From a shell:
 
 ```bash
-penguin set SPEAK_ENGINE piper                              # the alarm's greeting in Piper's voice
-penguin-sound say -e espeak "$(penguin-weather speech -e espeak)"
-penguin-sound say -e piper "$(penguin-weather speech -e piper)"   # about 40 s before it speaks
+penguin-sound say "$(penguin-weather speech)"                 # rendered now: about 40 s before it speaks
+penguin-sound say --ready "$(penguin-weather speech --clips)" # what a tap on the clock says, at once
 ```
+
+Until v0.3.1 espeak-ng's robotic voice answered the tap; it is gone as a voice. Its package stays:
+Piper reads its phoneme data.
 
 Piper comes from Alpine's edge/testing repository, built against libraries newer than the
 system's, so [build-piper.sh](scripts/build-piper.sh) copies it with every library it loads and their
@@ -662,7 +665,7 @@ work/out/     the finished boot images, kernels and rootfs tarballs
 
 ## Status and next steps
 
-**Current version: v0.3.1** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
+**Current version: v0.3.2** ([CHANGELOG.md](CHANGELOG.md)). It runs on an Echo Show 5 2nd gen with
 the docker kernel. `verify.sh` passes, and these have all been tested on the unit: warm reboots,
 power cuts, slot switches with rollback protection, Docker, the touch screen, the speaker and the
 SSH controls.

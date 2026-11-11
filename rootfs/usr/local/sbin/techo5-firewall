@@ -17,7 +17,8 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 . /etc/penguin/defaults.conf
-[ -r /data/penguin/settings.conf ] && . /data/penguin/settings.conf
+# One the shell cannot parse is left out (as p_settings does): sourcing it would end this script.
+[ -r /data/penguin/settings.conf ] && sh -n /data/penguin/settings.conf 2>/dev/null && . /data/penguin/settings.conf
 
 command -v iptables-legacy > /dev/null || { echo "techo5-firewall: no iptables-legacy in this image" >&2; exit 0; }
 CHAIN=PENGUIN-IN

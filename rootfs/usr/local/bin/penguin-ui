@@ -16,8 +16,9 @@ light sensor with AUTO_BRIGHTNESS=1, and volume).
 Around the alarms: a tap anywhere on a ringing alarm (or a volume button) stops it, and its volume
 climbs from WAKE_VOLUME_START (a percent of VOLUME) to VOLUME over WAKE_RAMP s. WAKE_LIGHT minutes
 before an alarm, a screen left alone shows a sunrise: warm colours that brighten while the backlight
-climbs. Once stopped, the alarm is followed by the time and the weather, spoken (SPEAK_ALARM): with
-SPEAK_ENGINE=piper in Piper's natural voice, rendered ahead of the alarm (it is slow here). Left
+climbs. Once stopped, the alarm is followed by the time and the weather, spoken (SPEAK_ALARM) in
+Piper's natural voice: rendered ahead of the alarm, as Piper is slow here; a tap on the home clock is
+said at once from clips rendered ahead, in the same voice (PIPER_VOICE). Left
 alone in a dark room, the screen shows only a dim night clock (NIGHT_CLOCK, NIGHT_COLOR). With
 SLEEP_LOG=1 the room going dark and lit again, and each alarm's ring and stop, go to the sleep diary
 that penguin-sleep reads. The colours come from the console's palette (ESC ] P), set for those views
@@ -64,17 +65,24 @@ CLOCK_SET = 1577836800           # 2020-01-01: before it the clock is not set ye
 IDLE = 30                        # s without a touch before the night clock or the sunrise
 RING_MAX = 600                   # s an unanswered ring lasts
 STEADY = 120                     # s the room must stay dark (or lit) before the diary records it
-# The time and the weather, spoken: the text from penguin-weather, the voice from penguin-sound. At once
-# (a tap on the clock, or no greeting rendered in time) it is espeak-ng: instant. With SPEAK_ENGINE=piper
-# the alarm's greeting is Piper's natural voice instead, which needs some 40 s for a sentence on this CPU:
-# rendered in the background SPEECH_AHEAD s before the alarm (niced), played when the alarm is stopped.
-SPEAK = ['sh', '-c', 'text=$(penguin-weather speech -e espeak) && [ -n "$text" ] '
-         '&& exec penguin-sound say -e espeak "$text"']
-RENDER = ['nice', '-n', '10', 'sh', '-c', 'text=$(penguin-weather speech -e piper --alarm "$1") '
-          '&& [ -n "$text" ] && exec penguin-sound render -e piper "$2" "$text"', 'render']
+# The time and the weather, spoken: the text from penguin-weather, the voice from penguin-sound: Piper,
+# a natural voice, which needs some 19 s to load and seconds more a phrase on this CPU. So nothing is
+# rendered when it is wanted. A tap on the clock is said from clips rendered ahead (SPEAK: only what is
+# there, at once): the hours and the minutes once, for good (PREPARE 'fixed', some ten minutes after the
+# first start or a change of voice), the weather's sentences after each fetch (PREPARE 'now'). An
+# alarm's greeting is rendered whole SPEECH_AHEAD s before it (RENDER), played when it is stopped. All
+# niced; penguin-sound runs one Piper at a time.
+SPEAK = ['sh', '-c', 'text=$(penguin-weather speech --clips) && [ -n "$text" ] '
+         '&& exec penguin-sound say --ready "$text"']
+RENDER = ['nice', '-n', '10', 'sh', '-c', 'text=$(penguin-weather speech --alarm "$1") '
+          '&& [ -n "$text" ] && exec penguin-sound render "$2" "$text"', 'render']
+PREPARE = {'fixed': ['nice', '-n', '10', 'sh', '-c', 'text=$(penguin-weather phrases) && [ -n "$text" ] '
+                     '&& exec penguin-sound prepare --keep "$text"'],
+           'now': ['nice', '-n', '10', 'sh', '-c', 'text=$(penguin-weather speech --clips) && [ -n "$text" ] '
+                   '&& exec penguin-sound prepare "$text"']}
 PIPER = '/usr/local/bin/piper'
-SPEECH_AHEAD = 600               # s before an alarm its Piper greeting starts rendering
-SPEECH_WAIT = 60                 # s after a stop to wait for a greeting still rendering, then espeak-ng
+SPEECH_AHEAD = 600               # s before an alarm its greeting starts rendering
+SPEECH_WAIT = 60                 # s after a stop to wait for a greeting still rendering, then the clips
 RUN = '/run/penguin'
 DEVNULL = subprocess.DEVNULL
 
@@ -810,12 +818,18 @@ class App:
         self.beep_proc = None        # the ring's last beeps
         self.speak_due = None        # when an alarm was stopped: speak once the speaker is free
         self.spoken_for = None       # the alarm (date and time) that was stopped, for its greeting
-        self.greeting = None         # the Piper greeting being rendered or ready: key, job, path
+        self.greeting = None         # the alarm's greeting being rendered or ready: key, job, path
+        # The clips a tap on the clock is said from: what is left to render, the job rendering now.
+        self.prep, self.prep_what, self.prep_todo = None, None, set()
+        self.prep_voice, self.prep_at = None, time.time() + 30
+        self.ip, self.ip_at = '', 0
+        self.vol_text, self.vol_at = '?', 0
         self.speech, self.spoke_at = None, 0
         self.tools, self.tools_at = {}, 0
         # Background commands: the weather (fetch, and the home screen's line), the sleep diary.
         self.weather_line, self.weather_line_at, self.weather_line_job = '', 0, None
         self.weather_job, self.weather_next, self.weather_loc = None, time.time() + 15, None
+        self.started = time.time()
         self.weather_started = 0
         self.nights, self.nights_at, self.nights_job = None, 0, None
         self.trim_at = time.time() + 600
@@ -1049,8 +1063,12 @@ class App:
                 rc = self.weather_job.poll()
                 if rc is not None:
                     self.weather_job = None
-                    self.weather_next = now + (1800 if rc in (0, 2) else 300)
+                    # (every minute in the UI's first five: boot.sh joins the network in the background)
+                    self.weather_next = now + (1800 if rc in (0, 2) else 60 if now - self.started < 300
+                                               else 300)
                     self.weather_line_at = 0  # the new data on the screen at once
+                    if rc == 0:
+                        self.prep_todo.add('now')  # and its sentences rendered, for a tap on the clock
                 elif now - self.weather_started > 120:
                     self.weather_job.terminate()  # stuck (it gives up after ~15 s itself)
                     self.weather_job, self.weather_next = None, now + 300
@@ -1058,13 +1076,14 @@ class App:
                 self.weather_loc, self.weather_started = (lat, lon), now
                 self.weather_job = spawn(['penguin-weather', 'update'])
                 self.weather_next = now + 1800
-            # The home screen's line, from the cache, every minute (one that failed keeps the last).
+            # The home screen's line, from the cache, every minute while it is shown (one that failed
+            # keeps the last).
             if self.weather_line_job is not None:
                 if self.weather_line_job.done():
                     if self.weather_line_job.ok:
                         self.weather_line = self.weather_line_job.text().split('\n')[0]
                     self.weather_line_job = None
-            elif now - self.weather_line_at >= 60:
+            elif self.mode == 'ui' and self.view == 'home' and now - self.weather_line_at >= 60:
                 self.weather_line_at = now
                 self.weather_line_job = Job(['penguin-weather', 'line'], 2)
         else:
@@ -1190,7 +1209,9 @@ class App:
         s.center(9, status)
         w, gap = 25, 1
         x0 = (COLS - 3 * w - 2 * gap) // 2
-        ip = (ip_of() or 'no network').split('/')[0]
+        if time.time() - self.ip_at > 10:  # not on every frame: it is a process started
+            self.ip, self.ip_at = ip_of(), time.time()
+        ip = (self.ip or 'no network').split('/')[0]
         items = [('Logs', 'logs', 'kernel, boot, sessions'), ('System', 'system', 'CPU, RAM, storage'),
                  ('Network & SSH', 'ssh', ip),
                  ('Clock', 'clock', 'alarm, stopwatch, timer'), ('Installed', 'installed', 'Docker, packages'),
@@ -1202,7 +1223,7 @@ class App:
         # After the six, so a tap between two lines goes to them, as before: the big clock speaks the
         # time and the weather.
         self.buttons.append((2, 0, 5, COLS, 'speak'))
-        if self.have('penguin-weather') and self.have('penguin-sound'):
+        if self.can_speak():
             self.footer('tap a button, or the clock to hear the time and the weather')
         else:
             self.footer('tap a button')
@@ -1258,7 +1279,9 @@ class App:
         s = self.scr
         self.header('Display & sound')
         bl = self.backlight()
-        vol = sh(['penguin-sound', 'volume']) or '?'
+        if time.time() - self.vol_at > 10:  # not on every frame: it is two processes started
+            self.vol_text, self.vol_at = sh(['penguin-sound', 'volume']) or '?', time.time()
+        vol = self.vol_text
         auto = self.auto_wanted()
         if auto:
             lo, hi = self.auto_range()
@@ -1472,7 +1495,7 @@ class App:
             elif music:
                 self.start_player(music, 'preview')
             else:
-                subprocess.Popen(['penguin-sound', 'beep', '988', '180', '3'])
+                spawn(['penguin-sound', 'beep', '988', '180', '3'])
         elif action.startswith('edit:'):
             self.view, self.edit, self.confirm = 'alarm', int(action[5:]), None
         elif action.startswith('switch:'):
@@ -1563,7 +1586,7 @@ class App:
         elif action in ('vol-', 'vol+'):
             self.volume(10 if action == 'vol+' else -10)
         elif action == 'beep':
-            subprocess.Popen(['penguin-sound', 'beep', '880', '250', '2'])
+            spawn(['penguin-sound', 'beep', '880', '250', '2'])
         elif action in ('ssh-toggle', 'ssh-any'):
             # Two taps: a stray touch must not cut SSH off, or open it to everyone. And none for
             # 3 s after it acted, so the taps that follow it do not undo it.
@@ -1667,20 +1690,44 @@ class App:
     def vol_busy(self):
         return self.vol_want is not None or (self.vol_job is not None and self.vol_job.poll() is None)
 
-    # Speech: penguin-weather writes the text, penguin-sound says it. Either one missing: nothing.
+    # Speech: penguin-weather writes the text, penguin-sound says it with Piper. One missing: nothing.
+
+    def can_speak(self):
+        return self.have('penguin-weather') and self.have('penguin-sound') and os.access(PIPER, os.X_OK)
 
     def speak(self):
-        if not (self.have('penguin-weather') and self.have('penguin-sound')):
-            return
-        if self.speech is None or self.speech.poll() is not None:
+        """The time and the weather from the clips there are, at once (see SPEAK)."""
+        if self.can_speak() and self.speech is None:
             self.speech = spawn(SPEAK)
 
+    def prepare_speech(self):
+        """Keep the clips a tap on the clock needs rendered, one job at a time: all of them from 30 s
+        after the start (nothing to do when they are there) and for a new voice, the weather's after
+        each fetch. A job that failed is tried again ten minutes later."""
+        now = time.time()
+        if self.prep is not None:
+            rc = self.prep.poll()
+            if rc is None:
+                return
+            self.prep = None
+            if rc:
+                self.prep_todo.add(self.prep_what)
+                self.prep_at = now + 600
+        voice = self.conf.get('PIPER_VOICE', '')
+        if voice != self.prep_voice:
+            self.prep_voice = voice
+            self.prep_todo.update(PREPARE)
+        if self.prep_todo and now >= self.prep_at and self.can_speak():
+            # The moment's own clips first (half a minute), then every hour and minute.
+            self.prep_what = 'now' if 'now' in self.prep_todo else 'fixed'
+            self.prep_todo.discard(self.prep_what)
+            self.prep = spawn(PREPARE[self.prep_what])
+
     def piper_wanted(self):
-        return (self.conf.get('SPEAK_ENGINE') == 'piper' and self.conf.get('SPEAK_ALARM', '1') == '1'
-                and os.access(PIPER, os.X_OK))
+        return self.conf.get('SPEAK_ALARM', '1') == '1' and self.can_speak()
 
     def render_greeting(self):
-        """SPEECH_AHEAD s before the next alarm, its greeting rendered by Piper in the background (once
+        """SPEECH_AHEAD s before the next alarm, its greeting rendered in the background (once
         per alarm); the file kept in /run/penguin until that alarm is stopped or another one comes."""
         g = self.greeting
         if g and g['job'] is not None and g['job'].poll() is not None:
@@ -1712,9 +1759,13 @@ class App:
 
     def speech_tick(self):
         """After an alarm was stopped: speak once the speaker is free (one sound at a time, a second one
-        is skipped): the track stopped, the last beeps done, the volume back. Piper's greeting for that
-        alarm when it is ready (waited for up to SPEECH_WAIT s while it renders), else espeak-ng at once.
-        Given up when the speaker stays busy for 15 s."""
+        is skipped): the track stopped, the last beeps done, the volume back. The greeting rendered for
+        that alarm when it is ready (waited for up to SPEECH_WAIT s while it renders), else the time now
+        from the clips. Given up when the speaker stays busy for 15 s."""
+        if self.speech is not None and self.speech.poll() is not None:
+            if self.speech.returncode == 4:  # a tap on the clock before its clips were rendered
+                self.say('the voice is still being prepared: try again in a few minutes', 4)
+            self.speech = None
         if self.speak_due is None:
             return
         g = self.greeting
@@ -1728,7 +1779,8 @@ class App:
               and (self.beep_proc is None or self.beep_proc.poll() is not None)):
             self.speak_due = None
             if g and g['ok']:
-                self.speech = spawn(['penguin-sound', 'play', g['path']])
+                if self.speech is None:
+                    self.speech = spawn(['penguin-sound', 'play', g['path']])
                 g['played'] = True  # its file goes when the next alarm's greeting is rendered
             else:
                 self.speak()
@@ -1776,8 +1828,9 @@ class App:
         new = max(0, min(100, int(cur) + delta))
         sh(['penguin-sound', 'volume', str(new)])
         self.set_setting('VOLUME', new)
+        self.vol_text, self.vol_at = str(new), time.time()
         self.say('volume %d %%' % new)
-        subprocess.Popen(['penguin-sound', 'beep', '880', '120'])
+        spawn(['penguin-sound', 'beep', '880', '120'])
 
     def tap(self, x, y):
         # Touch coordinates are the panel's portrait axes; the screen is that turned 90 degrees.
@@ -1873,13 +1926,20 @@ class App:
         self.write_diary()
         self.background()
         self.render_greeting()
+        self.prepare_speech()
         self.draw()
 
     def run(self):
         fds = [fd for fd in (self.touch, self.keys) if fd is not None]
+        stepped = 0
         while True:
-            self.step()
-            fast = self.view == 'clock' and self.tab == 'stopwatch' and self.clocks.sw_start
+            # Not once per batch of touch events: a finger on the screen sends them faster than that,
+            # and a tap draws for itself.
+            if time.monotonic() - stepped >= 0.09:
+                self.step()
+                stepped = time.monotonic()
+            fast = (self.mode == 'ui' and self.view == 'clock' and self.tab == 'stopwatch'
+                    and self.clocks.sw_start)
             # Wake at each half second: the clock changes on the second, and the display needs a
             # trigger well within each second to stay out of its idle mode (Screen.present).
             r, _, _ = select.select(fds, [], [], 0.1 if fast else 0.5 - time.time() % 0.5 + 0.002)

@@ -3,8 +3,10 @@
 
     penguin-weather update            fetch it now into /run/penguin/weather.json (WEATHER_LAT, WEATHER_LON)
     penguin-weather line              one line for the home screen; nothing without recent data
-    penguin-weather speech [-e ENGINE] [-v VOICE] [--alarm HH:MM]
+    penguin-weather speech [-v VOICE] [--alarm HH:MM] [--clips]
                                       the spoken greeting: the time (or when the alarm rang), then the weather
+    penguin-weather phrases [-v VOICE]
+                                      every greeting, hour and minute speech --clips may print, one per line
     penguin-weather find CITY         places by that name, one per line: LAT LON NAME, REGION, COUNTRY
     penguin-weather set CITY          make the first of them the location (penguin set), then update
     penguin-weather show [--json]     what the cache holds (--json: the cache itself, or null)
@@ -29,15 +31,17 @@ clock) and rain_hours (today's chance of rain hour by hour) let `line` and `spee
 current hour instead, and drop "today" once the place's day has changed. Data older than 3 hours is
 neither shown nor spoken. Temperatures are degrees Celsius.
 
-speech is in the language of the voice that will say it: VOICE, else the engine's (ENGINE, else
-SPEAK_ENGINE): PIPER_VOICE for piper, SPEAK_VOICE for espeak; Portuguese for pt*, else English.
---alarm HH:MM says when the alarm rang instead of the time now: penguin-ui renders that greeting with
-Piper minutes ahead of an alarm, so it is ready when the alarm is stopped.
+speech is in the language of the voice that will say it: VOICE, else PIPER_VOICE; Portuguese for pt*,
+else English. --alarm HH:MM says when the alarm rang instead of the time now: penguin-ui renders that
+greeting with Piper minutes ahead of an alarm, so it is ready when the alarm is stopped. --clips prints
+the greeting as penguin-sound's clips, one per line, the time as two that every minute of the day
+shares (its hour, then its minutes): Piper is too slow to speak a new sentence at a tap, so penguin-ui
+has penguin-sound render `phrases` once and the weather's sentences as they change, and a tap on the
+clock is answered from those. -e ENGINE is accepted and ignored (v0.3.1's option).
 
 PENGUIN_RUN (the cache's directory), PENGUIN_SETTINGS (the settings files, colon-separated) and
 PENGUIN_BIN (the penguin command) override the paths, for tests off the unit.
 """
-import http.client
 import json
 import math
 import os
@@ -45,10 +49,6 @@ import re
 import subprocess
 import sys
 import time
-import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 
 RUN = os.environ.get('PENGUIN_RUN', '/run/penguin')
 CACHE = os.path.join(RUN, 'weather.json')
@@ -131,6 +131,11 @@ def location(s):
 
 
 def get_json(url, params):
+    # Here, not at the top: line and speech, run every minute and at a tap, need no HTTP or TLS.
+    import http.client
+    import urllib.error
+    import urllib.parse
+    import urllib.request
     host = urllib.parse.urlsplit(url).hostname
     req = urllib.request.Request(url + '?' + urllib.parse.urlencode(params), headers={'User-Agent': 'echo-penguin'})
     try:
@@ -335,6 +340,26 @@ def clock_en(hour, minute):
     return 'It is %d %s%d.' % (hour % 12 or 12, 'oh ' if minute < 10 else '', minute)
 
 
+def clock_clips(hour, minute, pt):
+    """The time as clips every minute of the day shares: the hour, then its minutes (the first one
+    has no full stop: penguin-sound leaves a word's pause after it, not a sentence's)."""
+    if not minute:
+        return [clock_pt(hour, 0) if pt else clock_en(hour, 0)]
+    if pt:
+        return [clock_pt(hour, 1)[:-len(' e 1.')], 'e %d.' % minute]
+    return ['It is %d' % (hour % 12 or 12), '%s%d.' % ('oh ' if minute < 10 else '', minute)]
+
+
+def phrases(voice):
+    """Every greeting, hour and minute speech(clips=True) may print: what is rendered once, for good."""
+    pt = voice.lower().startswith('pt')
+    said = [greeting(h, pt) for h in (4, 12, 18)]
+    for h in range(24):
+        for m in range(60):
+            said += clock_clips(h, m, pt)
+    return list(dict.fromkeys(said))
+
+
 def at_hour_pt(hour):
     if hour == 0:
         return 'da meia-noite'
@@ -365,14 +390,17 @@ def alarm_en(hour, minute):
     return 'The alarm went off at %s.' % at
 
 
-def speech(w, voice, now=None, alarm=None):
-    """The greeting in voice's language: the time now, or with alarm=(hour, minute) when it rang."""
+def speech(w, voice, now=None, alarm=None, clips=False):
+    """The greeting in voice's language: the time now, or with alarm=(hour, minute) when it rang.
+    With clips, one clip per line (clock_clips), else one text."""
     pt = voice.lower().startswith('pt')
     lt = time.localtime(time.time() if now is None else now)
     if alarm:
         said = [greeting(alarm[0], pt), alarm_pt(*alarm) if pt else alarm_en(*alarm)]
     else:
-        said = [greeting(lt.tm_hour, pt), clock_pt(lt.tm_hour, lt.tm_min) if pt else clock_en(lt.tm_hour, lt.tm_min)]
+        said = [greeting(lt.tm_hour, pt)]
+        said += (clock_clips(lt.tm_hour, lt.tm_min, pt) if clips else
+                 [clock_pt(lt.tm_hour, lt.tm_min) if pt else clock_en(lt.tm_hour, lt.tm_min)])
     if w:
         n, t = w['now'], w['today']
         text = describe(n.get('code'), pt)
@@ -391,10 +419,11 @@ def speech(w, voice, now=None, alarm=None):
             elif t['rain_prob'] >= RAIN_MENTION:
                 said.append(('Chance de chuva de %d por cento.' if pt else '%d percent chance of rain.') %
                             t['rain_prob'])
-    return ' '.join(said)
+    return ('\n' if clips else ' ').join(said)
 
 
 def fold(s):
+    import unicodedata
     return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c)).casefold().strip()
 
 
@@ -474,21 +503,25 @@ def main(argv):
         if text:
             print(text)
         return 0
-    if cmd == 'speech':
+    if cmd in ('speech', 'phrases'):
+        clips = '--clips' in args
+        args = [a for a in args if a != '--clips']
         opts = dict(zip(args[::2], args[1::2]))
-        if len(args) % 2 or set(opts) - {'-e', '-v', '--alarm'}:
-            raise RuntimeError('usage: penguin-weather speech [-e ENGINE] [-v VOICE] [--alarm HH:MM]')
-        conf = settings()
-        engine = opts.get('-e') or conf.get('SPEAK_ENGINE') or 'espeak'
-        voice = opts.get('-v') or (conf.get('PIPER_VOICE') or 'pt_BR-faber-medium' if engine == 'piper'
-                                   else conf.get('SPEAK_VOICE') or 'en')
+        if len(args) % 2 or set(opts) - ({'-e', '-v', '--alarm'} if cmd == 'speech' else {'-v'}) or (
+                clips and cmd != 'speech'):
+            raise RuntimeError('usage: penguin-weather speech [-v VOICE] [--alarm HH:MM] [--clips]\n'
+                               '       penguin-weather phrases [-v VOICE]')
+        voice = opts.get('-v') or settings().get('PIPER_VOICE') or 'pt_BR-faber-medium'
+        if cmd == 'phrases':
+            print('\n'.join(phrases(voice)))
+            return 0
         alarm = None
         if '--alarm' in opts:
             m = re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', opts['--alarm'])
             if not m:
                 raise RuntimeError('--alarm: HH:MM')
             alarm = int(m.group(1)), int(m.group(2))
-        print(speech(current(), voice, alarm=alarm))
+        print(speech(current(), voice, alarm=alarm, clips=clips))
         return 0
     if cmd == 'find' and args:
         found = candidates(' '.join(args))

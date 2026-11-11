@@ -3,8 +3,9 @@
 
     penguin-sound beep [HZ [MS [COUNT]]]   a tone (default 880 Hz, 200 ms, once)
     penguin-sound play FILE                an MP3 (mpg123) or a 48 kHz 16-bit stereo WAV; SIGTERM stops it
-    penguin-sound say [-e ENGINE] [-v VOICE] TEXT...         TEXT spoken (espeak-ng or Piper)
-    penguin-sound render [-e ENGINE] [-v VOICE] OUT TEXT...  the same into OUT (a WAV), not played
+    penguin-sound say [-v VOICE] [--ready] TEXT...    TEXT spoken (Piper)
+    penguin-sound render [-v VOICE] OUT TEXT...       the same into OUT (a WAV), not played
+    penguin-sound prepare [-v VOICE] [--keep] TEXT... TEXT's clips made ahead, not played
     penguin-sound volume [PERCENT]         show or set the amplifier volume (0-100)
 
 Playback is the MediaTek AFE's DL1 path, card 0 device 23 (S16_LE, stereo, 48 kHz). Two rules from
@@ -26,23 +27,35 @@ Only one sound plays at a time: a second one, while another plays, is skipped ra
 SIGTERM stops a playback cleanly (the players first, the held capture node last), which is how
 penguin-ui stops the alarm's music.
 
-say and render synthesize TEXT with ENGINE: espeak-ng (fast, robotic; VOICE an espeak-ng voice such as
-pt-br, default SPEAK_VOICE) or piper (Piper, a neural voice: natural, but some 40 s for a sentence on
-this CPU; VOICE a model in /data/penguin/voices or /usr/share/piper/voices, default PIPER_VOICE). The
-default engine is SPEAK_ENGINE, the settings read from defaults.conf, then /data/penguin/settings.conf.
-Either output (22050 Hz mono; Piper's in 32-bit float) is converted to 48 kHz stereo 16-bit, and say
-plays it like a beep. penguin-ui says the time and the weather with it (penguin-weather speech) after
-an alarm, rendering Piper's version ahead of the alarm.
+Speech is Piper's, a neural voice that sounds like a person reading: VOICE is a model in
+/data/penguin/voices or /usr/share/piper/voices (default PIPER_VOICE, read from defaults.conf, then
+/data/penguin/settings.conf). It is slow on this CPU: some 19 s to load the model, then 2 to 7 s a
+phrase. So speech is made of clips, kept: each line of TEXT is one clip, rendered once (all the missing
+ones of a call by one Piper run), stored as the speaker takes it (the silence around it trimmed) and
+joined when said, with a sentence's pause after a line that ends one and a word's after any other.
+prepare renders clips ahead: into /run/penguin/speech, where one not asked for in three hours goes, or
+with --keep into /data/penguin/speech, for good (another voice's clips are removed). say renders what
+is missing first; say --ready never waits: it says the clips there are, up to the first missing one
+(exit status 4 when that is the first). penguin-ui prepares the hours, the minutes and the weather's
+sentences (penguin-weather phrases, speech --clips), so a tap on the clock is answered at once, and
+renders an alarm's greeting ahead of it. One Piper runs at a time. -e ENGINE is accepted and ignored
+(v0.3.1 had espeak-ng's robotic voice as a second engine; its package stays, for the phoneme data
+Piper reads).
 """
 import fcntl
+import hashlib
+import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
+import time
 import wave
 from array import array
 from itertools import chain, count, cycle, islice, repeat
@@ -59,10 +72,14 @@ VOLUME_CONTROLS = ('Master TAS5805m Playback Volume A',  # TI TAS5805M
                    'Digital Volume A')                    # Maxim MAX98396
 MAX98396_SAFE_MODE = 'Speaker Safe Mode A'  # a ~30 dB power cap the MAX98396 comes up with
 SETTINGS = ('/etc/penguin/defaults.conf', '/data/penguin/settings.conf')
-SAY_LIMIT = 60  # s: espeak-ng takes well under a second for a sentence
-PIPER_LIMIT = 300  # s: Piper takes some 40 s for a sentence here (most of it loading the model)
+PIPER_LIMIT = 300  # s without a clip from Piper before it is stopped (the model loads in some 19 s here)
+PIPER_BATCH = 10   # clips a Piper run: a long list gives way to another caller between two runs
 PIPER = '/usr/local/bin/piper'
 VOICES = ('/data/penguin/voices', '/usr/share/piper/voices')
+KEEP = '/data/penguin/speech'  # clips kept for good: the hours, the minutes (prepare --keep)
+TEMP = RUN + '/speech'         # the others (the weather's sentences), until TEMP_AGE s unused
+TEMP_AGE = 3 * 3600
+QUIET = 200                    # of 32767: below it a sample is silence (trimmed around a clip)
 
 
 def amixer(*args, check=False):
@@ -172,13 +189,12 @@ def read_wav(path):
     return channels, rate, samples
 
 
-def device_format(src, dst):
-    """A 16-bit WAV converted to what device 23 takes (S16_LE, stereo, 48 kHz): linear interpolation,
+def convert(channels, rate, samples):
+    """16-bit samples as frames of what device 23 takes (S16_LE, stereo, 48 kHz): linear interpolation,
     mono computed once for both sides. Built from map() and itertools, which loop in C: about two
     seconds on the unit for ten seconds of speech (a plain Python loop over the samples took five)."""
-    channels, rate, samples = read_wav(src)
     if channels not in (1, 2) or not rate:
-        raise RuntimeError('%s: not a mono or stereo WAV' % src)
+        raise RuntimeError('not a mono or stereo WAV')
     n = len(samples) // channels
     n_out = n * RATE // rate
     # Output sample i sits at input position i * rate / RATE: index j and fraction f (in 1/RATE). Both
@@ -204,11 +220,39 @@ def device_format(src, dst):
             out[side::2] = conv
     if sys.byteorder == 'big':
         out.byteswap()
-    with wave.open(dst, 'wb') as w:
-        w.setnchannels(2)
-        w.setsampwidth(2)
-        w.setframerate(RATE)
-        w.writeframes(out.tobytes())
+    return out.tobytes()
+
+
+def write_wav(path, frames):
+    """Frames in the device's format as a WAV file, written atomically and through to the disk (a
+    clip on /data must not come back empty after a power cut)."""
+    tmp = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(tmp, 'wb') as f:
+            with wave.open(f, 'wb') as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(RATE)
+                w.writeframes(frames)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def trimmed(channels, rate, samples):
+    """The samples without the silence Piper leaves around the speech (20 ms of it kept): the pauses
+    between clips are join()'s."""
+    n = len(samples)
+    first = next((i for i in range(n) if abs(samples[i]) > QUIET), n)
+    last = next((i for i in range(n - 1, -1, -1) if abs(samples[i]) > QUIET), -1)
+    if last < first:
+        return samples
+    pad = channels * (rate // 50)
+    a, b = max(0, first - pad), min(n, last + 1 + pad)
+    return samples[a - a % channels:b + -b % channels]
 
 
 def wav_format(path):
@@ -231,56 +275,133 @@ def piper_model(voice):
     raise RuntimeError('no Piper voice %s in %s' % (voice, ' or '.join(VOICES)))
 
 
-def synthesize(engine, voice, text, path):
-    """TEXT spoken into a WAV file at path by espeak-ng or Piper, as it comes (not yet converted)."""
-    if engine == 'piper':
-        if not os.access(PIPER, os.X_OK):
-            raise RuntimeError('Piper is not installed (%s)' % PIPER)
-        cmd, limit = [PIPER, '-m', piper_model(voice), '-f', path], PIPER_LIMIT
-    else:
-        if not shutil.which('espeak-ng'):
-            raise RuntimeError('espeak-ng is not installed: say needs it')
-        # -w, not --stdout: its WAV header then holds the real length, not a streaming 2 GB.
-        cmd, limit = ['espeak-ng', '-v', voice, '-w', path], SAY_LIMIT
-    # The text goes on stdin, as it may start with a dash. espeak-ng reports a file it cannot write
-    # on stderr only, with exit status 0; Piper logs on stderr, so for it only the status counts.
-    r = subprocess.run(cmd, input=text.encode(), capture_output=True, timeout=limit)
-    why = (r.stderr or r.stdout).decode(errors='replace').strip()
-    if r.returncode or (engine != 'piper' and why) or not os.path.isfile(path) or os.path.getsize(path) <= 44:
-        raise RuntimeError('%s -v %s: %s' % (engine, voice, why.splitlines()[-1] if why else
-                                             'exit %d, no sound' % r.returncode))
+def clip(voice, text, keep=False):
+    """Where the clip of a text in a voice is kept."""
+    name = os.path.basename(voice)
+    name = name[:-5] if name.endswith('.onnx') else name
+    return os.path.join(KEEP if keep else TEMP, name, hashlib.sha1(text.encode()).hexdigest()[:24] + '.wav')
 
 
-def speech(text, engine, voice, path):
-    """TEXT spoken into a WAV file in the device's format (device_format), written atomically."""
-    tmp = '%s.%d.tmp' % (path, os.getpid())
+def cached(voice, text):
+    """The clip of a text when there is one, else None."""
+    for keep in (True, False):
+        path = clip(voice, text, keep)
+        try:
+            if os.path.getsize(path) > 44:
+                return path
+        except OSError:
+            pass
+    return None
+
+
+def piper(model, texts, done):
+    """The texts spoken by one Piper run, the model loaded once: done(text, wav) as each one comes
+    (Piper's own WAV: 22050 Hz mono, 16-bit or 32-bit float)."""
+    if not os.access(PIPER, os.X_OK):
+        raise RuntimeError('Piper is not installed (%s)' % PIPER)
+    work = tempfile.mkdtemp(prefix='piper-', dir=RUN)
     try:
-        synthesize(engine, voice, text, tmp)
-        device_format(tmp, tmp + '.48k')
-        os.replace(tmp + '.48k', path)
+        jobs = {os.path.join(work, '%d.wav' % i): t for i, t in enumerate(texts)}
+        # JSON lines: a text may start with a dash, and each one names its own file.
+        lines = ''.join(json.dumps({'text': t, 'output_file': p}, ensure_ascii=False) + '\n'
+                        for p, t in jobs.items())
+        with open(os.path.join(work, 'log'), 'w+b') as log:
+            p = subprocess.Popen([PIPER, '-m', model, '--json-input'], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=log, bufsize=0)
+            try:
+                p.stdin.write(lines.encode())
+                p.stdin.close()
+                while jobs:  # Piper prints each file's path once it is written
+                    if not select.select([p.stdout], [], [], PIPER_LIMIT)[0]:
+                        raise RuntimeError('piper: nothing in %d s' % PIPER_LIMIT)
+                    line = p.stdout.readline()
+                    if not line:
+                        break
+                    path = line.decode(errors='replace').strip()
+                    if path in jobs and os.path.getsize(path) > 44:
+                        done(jobs.pop(path), path)
+                        os.remove(path)
+                rc = p.wait(timeout=30)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+            if rc or jobs:
+                log.seek(0)
+                why = log.read().decode(errors='replace').strip().splitlines()
+                raise RuntimeError('piper: %s' % (why[-1] if why else 'exit %d, %d clip(s) not made' % (
+                    rc, len(jobs))))
     finally:
-        for f in (tmp, tmp + '.48k'):
-            if os.path.exists(f):
-                os.remove(f)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def prepare(voice, texts, keep=False):
+    """The clips of the texts that have none yet, rendered and stored (for good with keep). One Piper
+    at a time on the unit (it takes most of a core and some 200 MB), PIPER_BATCH clips a run."""
+    dest = os.path.dirname(clip(voice, '', keep))
+    os.makedirs(dest, exist_ok=True)
+    texts = list(dict.fromkeys(texts))
+    if keep:  # one voice speaks: another one's clips only take room
+        for other in os.listdir(KEEP):
+            if other != os.path.basename(dest):
+                shutil.rmtree(os.path.join(KEEP, other), ignore_errors=True)
+    else:  # the clips asked for stay; one nobody asked for in TEMP_AGE s goes
+        wanted, now = {os.path.basename(clip(voice, t)) for t in texts}, time.time()
+        for name in os.listdir(dest):
+            path = os.path.join(dest, name)
+            try:
+                if name in wanted:
+                    os.utime(path)
+                elif now - os.path.getmtime(path) > TEMP_AGE:
+                    os.remove(path)
+            except OSError:
+                pass
+    missing = [t for t in texts if not cached(voice, t)]
+    if not missing:
+        return
+    model = piper_model(voice)
+
+    def store(text, wav):
+        channels, rate, samples = read_wav(wav)
+        write_wav(clip(voice, text, keep), convert(channels, rate, trimmed(channels, rate, samples)))
+
+    for i in range(0, len(missing), PIPER_BATCH):
+        with open(os.path.join(RUN, 'speech.lock'), 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            batch = [t for t in missing[i:i + PIPER_BATCH] if not cached(voice, t)]
+            if batch:
+                piper(model, batch, store)
+
+
+def join(voice, texts):
+    """The clips of the texts one after the other, as frames: a sentence's pause after a text that
+    ends one, a word's after any other (an hour, before its minutes)."""
+    out = bytearray()
+    for t in texts:
+        path = cached(voice, t)
+        if not path:
+            raise RuntimeError('no clip for "%s"' % t)
+        with wave.open(path, 'rb') as w:
+            out += w.readframes(w.getnframes())
+        out += bytes(4 * int(RATE * (0.35 if t[-1] in '.!?' else 0.06)))
+    return bytes(out)
 
 
 def speech_options(args):
-    """(engine, voice, rest) from [-e ENGINE] [-v VOICE] ..., the defaults from the settings."""
-    engine = voice = None
-    while len(args) > 1 and args[0] in ('-e', '-v'):
-        if args[0] == '-e':
-            engine = args[1]
-        else:
+    """(voice, flags, rest) from [-v VOICE] [--ready] [--keep] ..., the voice from the settings when
+    not given. -e ENGINE is skipped: v0.3.1's option, when espeak-ng was an engine too."""
+    voice, flags = None, set()
+    while args and args[0] in ('-e', '-v', '--ready', '--keep'):
+        if args[0].startswith('--'):
+            flags.add(args[0][2:])
+            args = args[1:]
+            continue
+        if len(args) < 2:
+            break
+        if args[0] == '-v':
             voice = args[1]
         args = args[2:]
-    conf = settings()
-    engine = engine or conf.get('SPEAK_ENGINE') or 'espeak'
-    if engine not in ('espeak', 'piper'):
-        raise RuntimeError('unknown engine %s (espeak or piper)' % engine)
-    if not voice:
-        voice = (conf.get('PIPER_VOICE') or 'pt_BR-faber-medium') if engine == 'piper' else (
-            conf.get('SPEAK_VOICE') or 'en')
-    return engine, voice, args
+    return voice or settings().get('PIPER_VOICE') or 'pt_BR-faber-medium', flags, args
 
 
 def players(path, device):
@@ -359,16 +480,26 @@ def main(argv):
                 argv[2], 'not a WAV file' if fmt is None else '%d Hz, %d channel(s), %d-bit' % (
                     fmt[0], fmt[1], 8 * fmt[2])))
         return play(argv[2], DEVICE)
-    if cmd in ('say', 'render') and len(argv) > 2:
-        engine, voice, args = speech_options(argv[2:])
+    if cmd in ('say', 'render', 'prepare') and len(argv) > 2:
+        voice, flags, args = speech_options(argv[2:])
         out = None
         if cmd == 'render' and args:
             out, args = args[0], args[1:]
-        text = ' '.join(args).strip()
-        if text and (out or cmd == 'say'):
+        texts = [t.strip() for t in ' '.join(args).splitlines() if t.strip()]
+        if texts and (out or cmd != 'render'):
             os.makedirs(RUN, exist_ok=True)
+            if cmd == 'prepare':
+                prepare(voice, texts, 'keep' in flags)
+                return 0
+            if 'ready' in flags:  # never waits: the clips there are, up to the first missing one
+                missing = [i for i, t in enumerate(texts) if not cached(voice, t)]
+                texts = texts[:missing[0]] if missing else texts
+                if not texts:
+                    return 4
+            else:
+                prepare(voice, texts)
             path = out or os.path.join(RUN, 'say-%d.wav' % os.getpid())
-            speech(text, engine, voice, path)
+            write_wav(path, join(voice, texts))
             if out:
                 return 0
             try:

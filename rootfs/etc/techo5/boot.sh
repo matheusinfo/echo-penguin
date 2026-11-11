@@ -121,22 +121,30 @@ t5_usb_acm
 # --- Network. Credentials: the file on userdata, first written from Android's saved network.
 t5_wifi_conf $LOGDIR/wpa_supplicant.conf
 export UDHCPC_SCRIPT=/etc/techo5/udhcpc.sh
-t5_wifi_up $WIFI_MODULE $LOGDIR/wpa_supplicant.conf
-p_ssh
-if [ -n "$IP" ]; then
-	t5_ntp
-	ntpd -S /etc/techo5/ntp-event.sh $(t5_ntp_peers) > /dev/null 2>&1
-fi
 
-# --- Network keeper: bring Wi-Fi back if it is gone, and reboot after 15 minutes without an
-# address: an unattended unit must never sit unreachable (plan, Stage 5).
+# --- Wi-Fi, SSH and the clock, in the background: init starts the screen and the supervisor only once
+# this script ends, and joining the network can take a minute and a half with the router off (60 s
+# for the association, 30 s for a lease, 40 s for NTP). The clock and the alarms must not wait for it.
+# Then the network keeper: bring Wi-Fi back if it is gone, and reboot after 15 minutes without an
+# address: an unattended unit must never sit unreachable (plan, Stage 5). Once an outage, though: the
+# reboot is for a Wi-Fi chip that one reboot brings back, and a router off for the night would
+# otherwise restart the unit every quarter of an hour, cutting the alarms each time. $LOGDIR/net-reboot
+# marks the outage that had its reboot, until the network is back.
 (
+	t5_wifi_up $WIFI_MODULE $LOGDIR/wpa_supplicant.conf
+	p_ssh
+	if [ -n "$IP" ]; then
+		t5_ntp
+		ntpd -S /etc/techo5/ntp-event.sh $(t5_ntp_peers) > /dev/null 2>&1
+	fi
+	cp /run/boot.log $LOGDIR/boot.log 2>/dev/null
 	down=0; lost=0
 	while true; do
 		sleep 60
 		if t5_wifi_joined; then lost=0; else lost=$((lost+1)); fi
 		if [ -n "$(t5_ip)" ] && [ $lost -lt 3 ]; then
 			down=0
+			[ -e $LOGDIR/net-reboot ] && rm -f $LOGDIR/net-reboot
 			if ! ip route show default 2>/dev/null | grep -q default; then
 				log "network: address but no default route; renewing the lease"
 				if [ -x /usr/local/sbin/techo5-net ]; then
@@ -171,8 +179,9 @@ fi
 		else
 			log "network: no address for $down min"
 		fi
-		if [ $down -ge 15 ]; then
-			log "network: rebooting"
+		if [ $down -ge 15 ] && [ ! -e $LOGDIR/net-reboot ]; then
+			: > $LOGDIR/net-reboot
+			log "network: rebooting (once for this outage)"
 			cp /run/boot.log $LOGDIR/boot.log 2>/dev/null
 			sync
 			reboot

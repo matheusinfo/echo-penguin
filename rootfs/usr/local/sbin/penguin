@@ -36,12 +36,12 @@ status() {
 	STORE=/store slotctl status 2>/dev/null | sed 's/^/  /'
 }
 
-# set_setting KEY VALUE: one setting into /data/penguin/settings.conf.
+# set_setting KEY VALUE: one setting into /data/penguin/settings.conf. Written whole beside it, synced
+# and renamed: a power cut leaves the old file or the new one, never one without the key.
 set_setting() {
+	f=$PENGUIN_DATA/settings.conf
 	mkdir -p $PENGUIN_DATA
-	touch $PENGUIN_DATA/settings.conf
-	sed -i "/^$1=/d" $PENGUIN_DATA/settings.conf
-	printf '%s="%s"\n' "$1" "$2" >> $PENGUIN_DATA/settings.conf
+	{ [ -f $f ] && grep -v "^$1=" $f; printf '%s="%s"\n' "$1" "$2"; } > $f.tmp && sync && mv -f $f.tmp $f
 }
 
 firewall_apply() { /usr/local/sbin/techo5-firewall > /data/techo5-linux/firewall.log 2>&1; tail -2 /data/techo5-linux/firewall.log | sed -n '1p'; }

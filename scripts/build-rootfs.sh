@@ -10,7 +10,7 @@
 # Includes the Wi-Fi driver for the docker kernel when $OUT/kernel-docker/mt76x8_wlan.ko exists
 # (build-kernel.sh docker); without it the rootfs only suits the safe kernel, and says so.
 # Includes Piper, the alarm's natural voice, from $WORK/piper/tree (build-piper.sh, run here the first
-# time); PIPER=0 leaves it out, and a failed Piper build only leaves the alarm with espeak-ng.
+# time); PIPER=0 leaves it out, and a failed Piper build leaves the unit without speech.
 # Output: $OUT/echo-penguin-rootfs-<version>.tar.gz
 . "$(dirname "$0")/lib.sh"
 
@@ -42,13 +42,13 @@ cp -r "$TECHO5/tools/linux/rootfs" "$STAGE/overlay-techo5"
 cp -r "$PENGUIN/rootfs" "$STAGE/overlay"
 # Piper, the alarm's natural voice (build-piper.sh; PIPER=0 leaves it out): built once, then reused.
 if [ "${PIPER:-1}" = 1 ] && [ ! -x "$WORK/piper/tree/usr/lib/piper/piper_exe" ]; then
-	"$PENGUIN/scripts/build-piper.sh" || note "Piper could not be built: the alarm speaks with espeak-ng only"
+	"$PENGUIN/scripts/build-piper.sh" || note "Piper could not be built: no speech"
 fi
 if [ "${PIPER:-1}" = 1 ] && [ -x "$WORK/piper/tree/usr/lib/piper/piper_exe" ]; then
 	cp -a "$WORK/piper/tree/." "$STAGE/overlay/"
 	note "Piper: included ($(tail -1 "$WORK/piper/tree/usr/lib/piper/packages"), voice $(ls "$WORK/piper/tree/usr/share/piper/voices" | grep '\.onnx$' | tr '\n' ' '))"
 else
-	note "no Piper: the alarm speaks with espeak-ng only"
+	note "no Piper: no speech"
 fi
 cp "$PENGUIN/rootfs-packages.txt" "$STAGE/packages.txt"
 cp "$PENGUIN/scripts/mkrootfs.sh" "$STAGE/mkrootfs.sh"

@@ -30,4 +30,4 @@ tini-static
 python3               # penguin-ui (the touch interface), penguin-sound, rebootto
 alsa-utils            # aplay, amixer: the speaker (penguin-sound)
 mpg123                # MP3 decoding for penguin-sound play (the alarm's music)
-espeak-ng             # penguin-sound say: the time and the weather spoken after an alarm (en, pt-br, ...)
+espeak-ng             # its phoneme data, which Piper (penguin-sound say) reads; its own voice is not used

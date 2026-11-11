@@ -69,7 +69,9 @@ last_reboot_check=
 while :; do
 	sleep 15 &
 	wait $!
-	if docker_wanted && ! docker_up; then
+	# The process and its socket, not docker_up: `docker info` every 15 s is the Docker CLI started
+	# and dockerd asked for a full report each time (a quarter of a core while it runs).
+	if docker_wanted && ! { [ -S /run/docker.sock ] && pidof dockerd >/dev/null; }; then
 		say "dockerd is not running; starting it"
 		start_dockerd
 	fi

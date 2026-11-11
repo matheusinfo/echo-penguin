@@ -6,10 +6,19 @@ PENGUIN_LOGS=$PENGUIN_DATA/logs
 # The Docker CLI keeps its config (buildx, logins) in ~/.docker; /root is on the read-only root.
 export DOCKER_CONFIG=$PENGUIN_DATA/docker-cli
 
-# p_settings: the image's defaults, then the unit's own overrides on userdata.
+# p_settings: the image's defaults, then the unit's own overrides on userdata. A settings.conf the
+# shell cannot parse (edited by hand, an unclosed quote) is left out: sourcing it would end the shell
+# that does, and that is boot.sh, the supervisor and `penguin set`, the one command that repairs it.
 p_settings() {
 	. /etc/penguin/defaults.conf
-	[ -r $PENGUIN_DATA/settings.conf ] && . $PENGUIN_DATA/settings.conf
+	if [ -r $PENGUIN_DATA/settings.conf ]; then
+		if sh -n $PENGUIN_DATA/settings.conf 2>/dev/null; then
+			. $PENGUIN_DATA/settings.conf
+		else
+			echo "penguin: $PENGUIN_DATA/settings.conf has a syntax error: the defaults are used" >&2
+			echo "penguin: $PENGUIN_DATA/settings.conf has a syntax error: the defaults are used" > /dev/kmsg 2>/dev/null
+		fi
+	fi
 	return 0
 }
 
